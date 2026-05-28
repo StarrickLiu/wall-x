@@ -31,7 +31,7 @@ This repository provides the training and inference code that supports our WALL 
 
 ## News
 ## News
-- We introduce [**Wall-OSS-0.5: A Deployment-Ready VLA with Gradient-Bridged Pretraining**](https://x2robot.com/api/files/file/wall_oss_05.pdf), an open-source 3B model that delivers directly deployable, zero-shot real-robot manipulation capabilities while serving as a powerful prior for downstream adaptation *(Code coming soon!)*.
+- We introduce [**Wall-OSS-0.5: A Deployment-Ready VLA with Gradient-Bridged Pretraining**](https://x2robot.com/api/files/file/wall_oss_05.pdf), an open-source 4B model that delivers directly deployable, zero-shot real-robot manipulation capabilities while serving as a powerful prior for downstream adaptation *(Code coming soon!)*.
 - We introduce [**WALL-OSS: Igniting VLMs toward the Embodied Space**](https://x2robot.com/en/research/68bc2cde8497d7f238dde690), an end-to-end embodied foundation model that leverages large-scale multimodal pretraining to achieve (1) embodiment-aware vision–language understanding, (2) strong language–action association, and (3) robust manipulation capability.
 
 ## Models
