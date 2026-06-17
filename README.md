@@ -69,12 +69,6 @@ export FLASH_ATTN_CUDA_ARCHS=$(python -c 'import torch; print(f"{torch.cuda.get_
 MAX_JOBS=4 pip install flash-attn==2.8.3 --no-build-isolation
 ```
 
-`FLASH_ATTN_CUDA_ARCHS` should match the compute capability of the GPU used to
-build and run Wall-X. If the build host has no visible GPU, set it manually
-instead. For the `flash-attn==2.8.3` source build, common supported values are
-`80` for A100/A800 and `90` for H100/H800; check FlashAttention's installation
-notes for other GPU families.
-
 Install DMuon, which is used by the default training configs:
 
 ```bash
