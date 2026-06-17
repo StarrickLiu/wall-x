@@ -29,8 +29,14 @@ conda activate wallx
 
 ```bash
 pip install -r requirements.txt
-MAX_JOBS=4 pip install flash-attn==2.7.4.post1 --no-build-isolation
+export FLASH_ATTN_CUDA_ARCHS=$(python -c 'import torch; print(f"{torch.cuda.get_device_capability()[0]}{torch.cuda.get_device_capability()[1]}")')
+MAX_JOBS=4 pip install flash-attn==2.8.3 --no-build-isolation
 ```
+
+`FLASH_ATTN_CUDA_ARCHS` 需要和编译、运行 Wall-X 的 GPU compute capability
+一致。如果构建机器不可见 GPU，可以手动设置。对于 `flash-attn==2.8.3`
+源码构建，常见支持值包括 A100/A800 使用 `80`，H100/H800 使用 `90`；
+其他 GPU 系列请参考 FlashAttention 安装说明。
 
 安装默认训练配置使用的 DMuon：
 

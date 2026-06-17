@@ -36,6 +36,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+usage() {
+    cat <<'EOF'
+Usage: bash scripts/run_libero.sh [CHECKPOINT_PATH]
+
+Environment:
+  CHECKPOINT_PATH=/path/to/checkpoint
+  CONFIG=/path/to/eval.yaml
+  LIBERO_PATH=/path/to/LIBERO
+  CUDA_ID=0
+  SMOKE=1
+EOF
+}
+
 if [[ -d "${SOURCE_ROOT}/third_party/LIBERO" ]]; then
     export PYTHONPATH="${SOURCE_ROOT}/third_party/LIBERO:${PYTHONPATH:-}"
 fi
@@ -61,15 +74,23 @@ DEFAULT_ALL_SUITES=(
     libero_10
 )
 
+case "${1:-}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
+esac
+
 if [[ $# -gt 1 ]]; then
-    echo "Usage: bash scripts/run_libero.sh [CHECKPOINT_PATH]" >&2
+    usage >&2
     exit 2
 fi
 if [[ $# -eq 1 ]]; then
     CHECKPOINT_PATH="$1"
 fi
 
-export CUDA_VISIBLE_DEVICES="${CUDA_ID:-0}"
+CUDA_IDS="${CUDA_ID:-0}"
+export CUDA_VISIBLE_DEVICES="${CUDA_IDS}"
 
 # MuJoCo offscreen rendering via NVIDIA EGL (required on headless GPU nodes).
 export MUJOCO_GL=egl
@@ -93,8 +114,10 @@ fi
 export __EGL_VENDOR_LIBRARY_FILENAMES="${EGL_VENDOR_FILE}"
 export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:/usr/local/nvidia/lib:/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}"
 
-# After CUDA_VISIBLE_DEVICES remapping, MuJoCo only sees devices from index 0.
-export MUJOCO_EGL_DEVICE_ID="${MUJOCO_EGL_DEVICE_ID:-0}"
+# robosuite validates this value against CUDA_VISIBLE_DEVICES on common
+# headless EGL stacks, so default to the first requested physical GPU id.
+FIRST_CUDA_ID="${CUDA_IDS%%,*}"
+export MUJOCO_EGL_DEVICE_ID="${MUJOCO_EGL_DEVICE_ID:-${FIRST_CUDA_ID:-0}}"
 if [[ -d "${SOURCE_ROOT}/third_party/harrix/python" ]]; then
     export PYTHONPATH="${SOURCE_ROOT}/third_party/harrix/python:${PYTHONPATH:-}"
 fi
