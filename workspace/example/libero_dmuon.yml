@@ -1,0 +1,149 @@
+# LIBERO single-arm finetune example using DMuon (RECOMMENDED optimizer).
+#
+# Same as libero.yml but with the DMuon optimizer, which converges
+# significantly better than AdamW on LIBERO in our experiments. For best
+# results we also recommend a global batch size of ~128 (batch_size_per_gpu x
+# gradient_accumulation_steps x num_gpus) -- raise gradient_accumulation_steps
+# to reach it on smaller GPU counts.
+#
+# Replace every /path/to/* placeholder before training:
+#
+#   model.config_path           -> model architecture JSON (mot_flash_mask_causal_xloss.json)
+#   model.processor_path        -> Qwen2.5-VL-3B-Instruct directory
+#   model.pretrained_path       -> same as processor_path, or HuggingFace cache path
+#   data.lerobot_config.repo_id -> local LeRobot dataset root (libero_all)
+#   data.norm_stats_path        -> q01/q99 normalization JSON
+#   checkpoint.save_path        -> writable directory for training checkpoints
+#   checkpoint.resume_from      -> Wall-OSS-0.5 pretrained .safetensors or checkpoint directory
+#
+# Compute norm stats first:
+#
+#   python scripts/compute_norm_stats.py \
+#     --train_config workspace/example/libero_dmuon.yml \
+#     --data_root /path/to/libero_all \
+#     --output_path /path/to/libero_all_norm_stats.json
+#
+# Launch training (from repo root):
+#
+#   torchrun --nproc_per_node=<N> wall_x/trainer/fsdp_trainer/train_fsdp.py \
+#     --config workspace/example/libero_dmuon.yml
+#
+# Strategy: keep dof / agent_pos totals at 26 to match the pretraining action space
+# via ``action_padding``. The lerobot collator right-pads libero's 7-dim action /
+# 8-dim state with zeros; loss does not flow through the padded tail.
+
+model_type: qwen2_5
+
+task:
+  # Libero delta action: pos3 + rot3 + gripper1 = 7, plus action_padding(19) = 26.
+  dof_config:
+    master_right_ee_cartesian_pos: 3     # delta position
+    master_right_ee_rotation: 3          # delta rotation (ZYX euler)
+    master_right_gripper: 1
+    action_padding: 19
+  ar_dof_config:
+    master_right_ee_cartesian_pos: 3
+    master_right_ee_rotation: 3
+    master_right_gripper: 1
+    action_padding: 19
+  # State: pos3 + rot3 + gripper2 = 8, plus action_padding(18) = 26.
+  agent_pos_config:
+    follow_right_ee_cartesian_pos: 3
+    follow_right_ee_rotation: 3
+    follow_right_gripper: 2
+    action_padding: 18
+  action_horizon: 10
+  action_horizon_flow: 10
+  use_state_string_representation: false
+
+model:
+  backbone: qwen2_5
+  config_path: /path/to/wall-oss-0.5/config.json
+  processor_path: /path/to/Qwen2.5-VL-3B-Instruct
+  pretrained_path: /path/to/Qwen2.5-VL-3B-Instruct
+  attn_deterministic: true
+  use_ema: false
+  flow_loss_weight: 1.0
+  ar_loss_weight: 0.01
+
+hyperparams:
+  num_epoch: 100
+  # Throughput note: the fused CUDA kernels (rmsnorm, silu, m_rope, MoE
+  # pack/unpack, ...) are compiled at install time and used automatically.
+  # To push training MFU on 80GB GPUs, raise batch_size_per_gpu (e.g. 24-36),
+  # bump data.num_workers (e.g. 8), and keep distributed.fsdp_sharding_strategy
+  # at shard_grad_op (below). The conservative defaults here run on modest GPUs.
+  batch_size_per_gpu: 4
+  gradient_accumulation_steps: 4
+  seed: 10222
+  optimizer:
+    optimizer_type: dmuon
+    # DMuon reads muon_lr / adamw_lr, NOT learning_rate. These are the
+    # recommended LIBERO values; do NOT rely on the built-in defaults
+    # (muon_lr=0.02 / adamw_lr=1e-3), which are far too large and diverge.
+    muon_lr: 0.0001       # 1e-4  (recommended)
+    adamw_lr: 0.00005     # 5e-5  (recommended)
+    momentum: 0.95
+    ns_steps: 5
+    muon_weight_decay: 0.0
+    adamw_betas: [0.9, 0.999]
+    adamw_weight_decay: 0.01
+    adamw_eps: 1.0e-8
+    max_grad_norm: 1.0
+    enable_grad_clip: true
+  scheduler:
+    scheduler_type: cosine
+    num_warmup_steps: 1000
+    num_training_steps: 200000
+    min_lr: 1.0e-6
+
+distributed:
+  use_fsdp: true
+  use_mixed_precision: true
+  bf16: true
+  # ZeRO-2: replicate params, shard only gradients + optimizer state. This
+  # skips the per-layer parameter all-gather that the full_shard (ZeRO-3)
+  # default pays every step, so throughput/MFU is substantially higher. Safe
+  # for the 3B model on any >=24GB GPU (replicated params are ~6GB in bf16).
+  # Switch to "full_shard" only if you OOM (many GPUs + very large batch).
+  fsdp_sharding_strategy: shard_grad_op
+
+data:
+  dataset_type: lerobot
+  lerobot_config:
+    repo_id: /path/to/libero_all
+    root: null
+  key_mappings:
+    # libero_all v3.0 only has faceImg + rightImg (no leftImg).
+    camera:
+      observation.images.faceImg: face_view
+      observation.images.rightImg: right_wrist_view
+    state: observation.state
+    action: action
+  norm_stats_path: /path/to/libero_all_norm_stats.json
+  train_test_split: 0.95
+  num_workers: 4
+  max_length: 1024
+  resolution:
+    face_view: 256
+    right_wrist_view: 256
+
+logging:
+  log_name: libero_ft
+  log_project: lerobot_libero_ft
+  log_entity: your_wandb_entity
+  use_wandb: true
+  log_interval: 10
+  save_interval: 2000
+  val_interval: 1000000
+  epoch_save_interval: 1
+
+checkpoint:
+  save_path: /path/to/libero
+  # Single-file .safetensors loads as pretrain weights before FSDP wrapping.
+  # Use a checkpoint directory for full resume (optimizer / scheduler / RNG).
+  resume_from: /path/to/wall-oss-0.5/model.safetensors
+
+debug:
+  profile: false
+  nvtx: false

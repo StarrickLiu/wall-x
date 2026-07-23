@@ -6,7 +6,7 @@ here. Internal backends register their dataclasses from their own packages via
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .registry import register_data_config
 
@@ -45,6 +45,7 @@ class LeRobotDataConfig(DataConfig):
     """
 
     dataset_type: str = "lerobot"
+    dataset_config_path: Optional[str] = None
     lerobot_config: Optional[Dict[str, Any]] = None
     key_mappings: Optional[Dict[str, Any]] = None
     norm_stats_path: Optional[str] = None
@@ -55,6 +56,19 @@ class LeRobotDataConfig(DataConfig):
     use_fast_tokenizer: bool = False
     padding_side: str = "left"
     noise_scheduler: Optional[Dict[str, Any]] = None
+    # --- qwen preprocess knobs (read by prompt/state encoding) ---
+    state_bins: int = 256
+    use_embodied_system_prompt_ratio: float = 0.0
+    rgb_keys: Optional[List[str]] = None
+    lowdim_keys: Optional[List[str]] = None
+    skip_interval: int = 2
+    image_history_length: int = 1
+    obs_history_stride: int = 0
+    event_level: bool = False
+    image_horizon: int = 16
+    future_image_length: int = 16
+    future_image_interval: int = 2
+    action_history_length: int = 1
 
 
 __all__ = [

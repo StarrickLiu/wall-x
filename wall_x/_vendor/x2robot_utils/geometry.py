@@ -1,9 +1,9 @@
 """Rotation / pose geometry utilities (pure numpy + numba).
 
 Shared between wall-x and internal_dataset_backend:
-- ``euler_to_matrix_zyx_6d_nb``: ZYX Euler -> flattened top-2-rows of R (N, 6)
-- ``so3_to_euler_zyx_batch_nb``: 6D rotation -> ZYX Euler (canonicalized)
-- ``compose_state_and_delta_to_abs_{rpy,6d}``: state + delta -> absolute pose
+- ``euler_to_matrix_zyx_6d_nb``: ZYX Euler → flattened top-2-rows of R (N, 6)
+- ``so3_to_euler_zyx_batch_nb``: 6D rotation → ZYX Euler (canonicalized)
+- ``compose_state_and_delta_to_abs_{rpy,6d}``: state ⊕ delta → absolute pose
 """
 
 import numpy as np
@@ -12,7 +12,7 @@ from numba import jit, prange
 
 @jit(nopython=True)
 def euler_to_matrix_zyx_6d_nb(eulers):
-    """Euler angles (N, 3) -> flattened top two rows of rotation matrix (N, 6)."""
+    """Euler angles (N, 3) → flattened top two rows of rotation matrix (N, 6)."""
     N = eulers.shape[0]
     R6 = np.empty((N, 6), dtype=np.float64)
     for i in prange(N):
@@ -70,7 +70,7 @@ def euler_to_matrix_zyx_batch_nb(eulers):
 
 @jit(nopython=True)
 def matrix_to_euler_zyx_batch_nb(Rs):
-    """R = Rz(yaw) * Ry(pitch) * Rx(roll) -> (roll, pitch, yaw)."""
+    """R = Rz(yaw) * Ry(pitch) * Rx(roll) → (roll, pitch, yaw)."""
     N = Rs.shape[0]
     eulers = np.empty((N, 3), dtype=np.float64)
     for i in prange(N):
@@ -137,7 +137,7 @@ def so3_to_matrix_batch_nb(batch_so3):
 
 @jit(nopython=True)
 def canonicalize_euler_zyx_batch_nb(rpy_batch):
-    """Canonicalize ZYX Euler angles so each component falls in (-pi, pi]."""
+    """Canonicalize ZYX Euler angles so each component falls in (-π, π]."""
     N = rpy_batch.shape[0]
     out = np.empty_like(rpy_batch)
     two_pi = 2.0 * np.pi
@@ -179,10 +179,10 @@ def so3_to_euler_zyx_batch_nb(batch_so3):
 
 @jit(nopython=True)
 def compose_state_and_delta_to_abs_rpy(delta, state):
-    """Compose a delta (ZYX rpy or 6D) with an absolute state -> absolute rpy(ZYX).
+    """Compose a delta (ZYX rpy or 6D) with an absolute state → absolute rpy(ZYX).
 
-    delta: (N, 3) deltarpy or (N, 6) delta6D. state: (3,) rpy or (6,) 6D.
-    Output: (N, 3) rpy canonicalized into (-pi, pi].
+    delta: (N, 3) Δrpy or (N, 6) Δ6D. state: (3,) rpy or (6,) 6D.
+    Output: (N, 3) rpy canonicalized into (-π, π].
     """
     if delta.shape[-1] == 3:
         R_delta = euler_to_matrix_zyx_batch_nb(delta)
@@ -242,7 +242,7 @@ def compose_state_and_delta_to_abs_rpy(delta, state):
 
 @jit(nopython=True)
 def compose_state_and_delta_to_abs_6d(delta, state):
-    """Compose a 6D delta with a 6D state -> absolute 6D rotation.
+    """Compose a 6D delta with a 6D state → absolute 6D rotation.
 
     delta: (N, 6). state: (6,). Output: (N, 6).
     """

@@ -1,7 +1,6 @@
-from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
-
-from qwen_vl_utils.vision_process import IMAGE_FACTOR, MAX_PIXELS, MIN_PIXELS
+from dataclasses import dataclass, field
+from qwen_vl_utils.vision_process import MIN_PIXELS, MAX_PIXELS, IMAGE_FACTOR
 
 
 @dataclass

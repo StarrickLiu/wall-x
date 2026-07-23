@@ -1,19 +1,28 @@
 """Action tokenizer mixin for loading tokenizers and action mappings."""
 
+import fcntl
+import hashlib
+import json
+import logging
+import os
+
+import torch
+import numpy as np
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Tuple, Union
-
-import numpy as np
-import torch
-from transformers import AutoProcessor
+from transformers import AutoProcessor, PreTrainedTokenizerFast
+from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from wall_x.utils.constant import is_action_dataset_name
+
+logger = logging.getLogger(__name__)
 
 # Delay imports so missing optional packages do not fail at import time
 try:
     from spatial_tokenizer.spatial_tokenizer import SpatialActionTokenizer
 except ImportError:
     SpatialActionTokenizer = None
+
 
 
 class ActionTokenizerMixin(ABC):
@@ -98,7 +107,7 @@ class ActionTokenizerMixin(ABC):
         Build action_mapper
 
         Args:
-            processor: HuggingFace processor,used to convert tokens to IDs
+            processor: HuggingFace processor，used to convert tokens to IDs
 
         Returns:
             action_mapper dictionary; format depends on tokenizer type
@@ -309,11 +318,72 @@ class FastTokenizerMixin(ActionTokenizerMixin):
         super().__init__()
         self._tokenizer_type = "fast"
 
+    @staticmethod
+    def _load_processor(action_tokenizer_path: str):
+        try:
+            return AutoProcessor.from_pretrained(
+                action_tokenizer_path, trust_remote_code=True
+            )
+        except ValueError as exc:
+            # Transformers 5.x loads non-primary ProcessorMixin attributes from
+            # a named subfolder. Older fast-tokenizer assets keep the backing
+            # tokenizer beside processor_config.json, so load that flat layout
+            # explicitly while leaving all other AutoProcessor failures intact.
+            required_files = ("processor_config.json", "tokenizer.json")
+            if "Couldn't instantiate the backend tokenizer" not in str(exc) or not all(
+                os.path.isfile(os.path.join(action_tokenizer_path, name))
+                for name in required_files
+            ):
+                raise
+
+            logger.debug(
+                "AutoProcessor failed; falling back to legacy flat layout: %s", exc
+            )
+
+            with open(
+                os.path.join(action_tokenizer_path, "processor_config.json"), "r"
+            ) as f:
+                processor_config = json.load(f)
+            class_reference = processor_config.get("auto_map", {}).get("AutoProcessor")
+            if not class_reference:
+                raise ValueError(
+                    f"processor_config.json in {action_tokenizer_path} "
+                    "does not define auto_map.AutoProcessor"
+                ) from exc
+
+            processor_class = get_class_from_dynamic_module(
+                class_reference, action_tokenizer_path, local_files_only=True
+            )
+            bpe_tokenizer = PreTrainedTokenizerFast.from_pretrained(
+                action_tokenizer_path, local_files_only=True
+            )
+            processor_kwargs = {
+                key: value
+                for key, value in processor_config.items()
+                if key not in {"auto_map", "processor_class"}
+            }
+            return processor_class(bpe_tokenizer, **processor_kwargs)
+
     def load_tokenizer(self, config: dict, normalizer, device: str = "cpu") -> Any:
         """Load the fast tokenizer"""
-        self._tokenizer = AutoProcessor.from_pretrained(
-            config["action_tokenizer_path"], trust_remote_code=True
-        )
+        action_tokenizer_path = config["action_tokenizer_path"]
+        lock_key = hashlib.sha1(
+            os.path.abspath(action_tokenizer_path).encode("utf-8")
+        ).hexdigest()[:16]
+        lock_path = f"/tmp/wallx_autoprocessor_{lock_key}.lock"
+
+        # Serialize concurrent AutoProcessor(trust_remote_code=True) loads across
+        # ranks — they race on HF's remote-code module cache. fcntl.flock is a
+        # kernel-held advisory lock that auto-releases when the fd is closed or the
+        # process dies, so there is no stale-lock timeout / TOCTOU cleanup to get
+        # wrong; waiters queue in the kernel instead of polling.
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            self._tokenizer = self._load_processor(action_tokenizer_path)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
         self.action_normalizer = normalizer
         return self._tokenizer
 
@@ -929,6 +999,7 @@ class SpatialVLATokenizerMixin(ActionTokenizerMixin):
             ar_action_mask[b, end_idx:prefix_length] = -1  # eos
 
         return {"ar_action_mask": ar_action_mask}
+
 
 
 # ============================================================

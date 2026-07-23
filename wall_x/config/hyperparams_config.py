@@ -32,6 +32,10 @@ class OptimizerConfig:
     action_expert_learning_rate: Optional[float] = None
     action_lr_keywords: Optional[List[str]] = None
 
+    @property
+    def use_dedicated_params(self) -> bool:
+        return False
+
 
 @register_optimizer_config("adamw")
 @dataclass
@@ -63,6 +67,31 @@ class DMuonConfig(OptimizerConfig):
     ns_backend: str = "gram"
     ns_coefficients: str = "default"
     nesterov: bool = True
+    owner_strategy: str = "lpt"
+    owner_cost_model: str = "optimizer"
+    owner_pack_small_params: bool = True
+    hsdp_column_balance: bool = True
+    record_step_profile: bool = False
+    first_step_progress_log_limit: int = 8
+    replicate_async: bool = True
+    group_prepare_ahead: bool = True
+    forward_prefetch_depth: int = 1
+
+    @property
+    def use_dedicated_params(self) -> bool:
+        return True
+
+
+@register_optimizer_config("naive_fsdp2_muon")
+@dataclass
+class NaiveFSDP2MuonConfig(DMuonConfig):
+    """Temporary FSDP2 baseline: every rank runs full-matrix Muon locally."""
+
+    optimizer_type: str = "naive_fsdp2_muon"
+
+    @property
+    def use_dedicated_params(self) -> bool:
+        return False
 
 
 @dataclass
@@ -91,9 +120,10 @@ class CosineSchedulerConfig(SchedulerConfig):
 @register_scheduler_config("constant")
 @dataclass
 class ConstantSchedulerConfig(SchedulerConfig):
-    """Constant learning rate with no decay."""
+    """Constant learning rate, optionally after linear warmup."""
 
     scheduler_type: str = "constant"
+    num_warmup_steps: int = 0
 
 
 @register_scheduler_config("step")
@@ -108,10 +138,26 @@ class StepSchedulerConfig(SchedulerConfig):
 
 @dataclass
 class TrainHyperParams:
+    # 训练算法判别器（依附于它所多态的 hyperparams section，与 model_type↔model 对称）：
+    # 选 TrainHyperParams 子类 + DDP trainer 路径。
+    #   "sl"(默认)=监督学习（model_type=rlt 时为 encoder warmup）; "td3"=off-policy TD3。
+    # loader._resolve_hyperparams_cls 按 (algorithm, model_type) 惰性路由到 RL 子类。
+    algorithm: str = "sl"
     num_epoch: int = 1
     batch_size_per_gpu: int = 1
     gradient_accumulation_steps: int = 1
     seed: int = 42
+    # opt-in 严格确定性：调 torch.use_deterministic_algorithms 让 same-seed +
+    # same-yaml 两次 run 在 pi0 路径下 step 0 forward byte-equal。caller 必须
+    # 同步在 launch 脚本里 export CUBLAS_WORKSPACE_CONFIG=:4096:8（库代码不
+    # silently setdefault env，避免 fork 出来的子进程 env 难追溯）。warn_only
+    # 内置 True：bf16 训练里总有几个 op 没确定实现，warn 比 crash 实用。
+    # default False 保兼容（公共 utility，pi0 以外的 model 可能含非 deterministic
+    # op，强开会抛 RuntimeError）。
+    # 这是确定性的**唯一开关**：除 torch.use_deterministic_algorithms 外，还派生
+    # model_config.attn_deterministic（pi0 / qwen2_5 / qwen3 / qwen3_5 的 attention
+    # 内核）——旧的独立 ``attn_deterministic`` yaml 字段已下线（MR !556 review）。
+    deterministic_algorithms: bool = False
     optimizer: OptimizerConfig = field(default_factory=AdamWConfig)
     scheduler: SchedulerConfig = field(default_factory=CosineSchedulerConfig)
 
@@ -122,6 +168,7 @@ __all__ = [
     "CosineSchedulerConfig",
     "DMuonConfig",
     "LRGroupConfig",
+    "NaiveFSDP2MuonConfig",
     "OptimizerConfig",
     "SchedulerConfig",
     "StepSchedulerConfig",

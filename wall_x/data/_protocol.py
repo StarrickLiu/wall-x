@@ -21,6 +21,8 @@ class BuildContext:
     tokenizer: Optional[Any] = None
     processor: Optional[Any] = None
     tokenizer_mixin: Optional[Any] = None
+    train_action_tokenizer: Optional[Any] = None
+    val_action_tokenizer: Optional[Any] = None
     normalizer_action: Optional[Any] = None
     normalizer_propri: Optional[Any] = None
     model_config: Optional[Any] = None

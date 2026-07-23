@@ -39,7 +39,13 @@ hyperparams:
   seed: 10233
   optimizer:
     optimizer_type: dmuon
-    learning_rate: 0.0001
+    # NOTE: DMuon reads muon_lr / adamw_lr, NOT learning_rate. Set them
+    # explicitly to the recommended LIBERO values below; do NOT rely on the
+    # built-in defaults (muon_lr=0.02 / adamw_lr=1e-3), which are far too large
+    # for this task and make training diverge (0% eval success).
+    muon_lr: 0.0001       # 1e-4  (recommended)
+    adamw_lr: 0.00005     # 5e-5  (recommended)
+    learning_rate: 0.0001  # unused by DMuon; kept for schema compatibility
     max_grad_norm: 1.0
     enable_grad_clip: true
     betas: [0.9, 0.95]
@@ -55,6 +61,12 @@ distributed:
   use_fsdp: true
   use_mixed_precision: true
   bf16: true
+  # ZeRO-2: replicate params, shard only gradients + optimizer state — skips the
+  # per-layer param all-gather of the full_shard (ZeRO-3) default, giving much
+  # higher throughput/MFU. Safe for the 3B model on any >=24GB GPU. Use
+  # "full_shard" only if you OOM. The fused CUDA kernels are compiled in and
+  # used automatically; raise batch_size_per_gpu + num_workers for higher MFU.
+  fsdp_sharding_strategy: shard_grad_op
 
 data:
   dataset_type: lerobot

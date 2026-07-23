@@ -15,7 +15,7 @@
 #include "device_launch_parameters.h"
 
 // Global FP8 guard: use CUDA_VERSION (defined in both host and device passes),
-// not __CUDA_ARCH__ (device-pass only - leaves host dispatchers unable to see
+// not __CUDA_ARCH__ (device-pass only — leaves host dispatchers unable to see
 // FP8 typedefs/branches). FP8 storage types arrived in CUDA 11.8.
 #if defined(CUDA_VERSION) && (CUDA_VERSION >= 11800)
 #include <cuda_fp8.h>
