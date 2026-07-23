@@ -13,7 +13,6 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import torch
 
 
 def _ensure_local_harrix_on_path() -> None:
@@ -56,35 +55,13 @@ def _build_fake_observation(seed: int, image_size: int, gripper_dim: int) -> dic
 
 
 def _predict_raw_action(adapter, payload: dict) -> np.ndarray:
-    from wall_x._vendor.harrix.envs.libero_common import encode_proprio
+    """Run one flow-inference pass via the adapter's batched predict path.
 
-    observation = encode_proprio(
-        payload["observation"], adapter._train_config, adapter._action_horizon
-    )
-    prefix, postfix = adapter._get_flow_prompt(payload["instruction"])
-    batch_inputs = adapter._construct_model_input([observation], [prefix], [postfix])
-
-    dataset_names = batch_inputs["dataset_names"]
-    padding = torch.zeros(
-        (len(dataset_names), 1, adapter._action_dim),
-        dtype=torch.float32,
-    )
-    padding_action = adapter._normalizer_action.normalize_data(
-        padding, dataset_names
-    ).to(batch_inputs["input_ids"].device)
-
-    model_output = adapter._model.generate_flow_action(
-        action_horizon=adapter._action_horizon,
-        action_dim=adapter._action_dim,
-        num_inference_timesteps=adapter._num_inference_timesteps,
-        padding_action=padding_action,
-        noise=payload.get("noise"),
-        **batch_inputs,
-    )
-    predict_action = model_output["predict_action"]
-    if isinstance(predict_action, torch.Tensor):
-        predict_action = predict_action.detach().cpu().numpy()
-    return np.asarray(predict_action[0])
+    ``predict_batch`` is the same path the LIBERO evaluation uses; it handles
+    proprio encoding, prompt construction, and flow sampling internally.
+    """
+    actions = adapter.predict_batch([payload])
+    return np.asarray(actions[0])
 
 
 def parse_args() -> argparse.Namespace:
@@ -117,9 +94,9 @@ def main() -> int:
     args = parse_args()
     _ensure_local_harrix_on_path()
 
-    import wall_x._vendor.harrix.adapters  # noqa: F401  register model adapters
-    from wall_x._vendor.harrix.adapters.registry import build_adapter
-    from wall_x._vendor.harrix.eval_config import (
+    import wall_x._vendor.harrix.e2e_infer.adapters  # noqa: F401  register model adapters
+    from wall_x._vendor.harrix.e2e_infer.adapters.registry import build_adapter
+    from wall_x._vendor.harrix.e2e_infer.config import (
         EvalConfig,
         LiberoEnvParams,
         autofill_from_checkpoint,
@@ -137,7 +114,9 @@ def main() -> int:
     cfg = autofill_from_checkpoint(cfg)
 
     adapter = build_adapter(cfg)
-    gripper_dim = _right_gripper_dim_from_config(getattr(adapter, "_train_config", {}))
+    gripper_dim = _right_gripper_dim_from_config(
+        {"agent_pos_config": getattr(adapter._typed_cfg.task, "agent_pos_config", {})}
+    )
     payload = {
         "observation": _build_fake_observation(args.seed, args.image_size, gripper_dim),
         "instruction": args.instruction,

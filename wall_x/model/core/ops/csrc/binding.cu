@@ -7,6 +7,27 @@
 #include <cstdint>
 #include <torch/extension.h>
 
+namespace tvm_ffi_rmsnorm {
+void RMSNorm(const at::Tensor& output, const at::Tensor& input, const at::Tensor& weight, double epsilon);
+void RMSNormZeroCentered(const at::Tensor& output, const at::Tensor& input, const at::Tensor& weight, double epsilon);
+void AddRMSNorm(const at::Tensor& sum_output, const at::Tensor& norm_output, const at::Tensor& residual, const at::Tensor& input, const at::Tensor& weight, double epsilon);
+void AddRMSNormZeroCentered(const at::Tensor& sum_output, const at::Tensor& norm_output, const at::Tensor& residual, const at::Tensor& input, const at::Tensor& weight, double epsilon);
+void AddRMSNormWithRstd(const at::Tensor& sum_output, const at::Tensor& norm_output, const at::Tensor& rstd_output, const at::Tensor& residual, const at::Tensor& input, const at::Tensor& weight, double epsilon);
+void AddRMSNormZeroCenteredWithRstd(const at::Tensor& sum_output, const at::Tensor& norm_output, const at::Tensor& rstd_output, const at::Tensor& residual, const at::Tensor& input, const at::Tensor& weight, double epsilon);
+void RMSNormBackward( const at::Tensor& dx, const at::Tensor& dw, const at::Tensor& partial_dw_view, const at::Tensor& dy, const at::Tensor& input, const at::Tensor& weight, double epsilon);
+void RMSNormZeroCenteredBackward( const at::Tensor& dx, const at::Tensor& dw, const at::Tensor& partial_dw_view, const at::Tensor& dy, const at::Tensor& input, const at::Tensor& weight, double epsilon);
+void AddRMSNormBackward( const at::Tensor& d_add, const at::Tensor& dw, const at::Tensor& partial_dw_view, const at::Tensor& grad_sum, const at::Tensor& grad_norm, const at::Tensor& sum_input, const at::Tensor& weight, double epsilon);
+void AddRMSNormZeroCenteredBackward( const at::Tensor& d_add, const at::Tensor& dw, const at::Tensor& partial_dw_view, const at::Tensor& grad_sum, const at::Tensor& grad_norm, const at::Tensor& sum_input, const at::Tensor& weight, double epsilon);
+void AddRMSNormBackwardWithRstd( const at::Tensor& d_add, const at::Tensor& dw, const at::Tensor& partial_dw_view, const at::Tensor& grad_sum, const at::Tensor& grad_norm, const at::Tensor& sum_input, const at::Tensor& weight, const at::Tensor& rstd);
+void AddRMSNormZeroCenteredBackwardWithRstd( const at::Tensor& d_add, const at::Tensor& dw, const at::Tensor& partial_dw_view, const at::Tensor& grad_sum, const at::Tensor& grad_norm, const at::Tensor& sum_input, const at::Tensor& weight, const at::Tensor& rstd);
+void GatedRMSNorm(const at::Tensor& output, const at::Tensor& input, const at::Tensor& gate, const at::Tensor& weight, double epsilon);
+void GatedRMSNormBackward( const at::Tensor& dx, const at::Tensor& dgate, const at::Tensor& dw, const at::Tensor& partial_dw_view, const at::Tensor& dy, const at::Tensor& input, const at::Tensor& gate, const at::Tensor& weight, double epsilon);
+void GatedRMSNormWithRstd(const at::Tensor& output, const at::Tensor& rstd, const at::Tensor& input, const at::Tensor& gate, const at::Tensor& weight, double epsilon, int64_t warps_per_block);
+void GatedRMSNormBackwardWithRstd( const at::Tensor& dx, const at::Tensor& dgate, const at::Tensor& dw, const at::Tensor& partial_dw_view, const at::Tensor& dy, const at::Tensor& input, const at::Tensor& gate, const at::Tensor& rstd, const at::Tensor& weight, double epsilon, int64_t warps_per_block);
+void AdaRMSNorm(const at::Tensor& output, const at::Tensor& gate, const at::Tensor& input, const at::Tensor& modulation, double epsilon);
+void AdaRMSNormBackward( const at::Tensor& dx, const at::Tensor& dmod, const at::Tensor& dy, const at::Tensor& dgate, const at::Tensor& input, const at::Tensor& modulation, double epsilon);
+}  // namespace tvm_ffi_rmsnorm
+
 namespace wallx_cuda_get_rope_index {
 void GetRopeIndex(const c10::optional<at::Tensor>& input_ids, const c10::optional<at::Tensor>& image_grid_thw, const c10::optional<at::Tensor>& video_grid_thw, const c10::optional<at::Tensor>& second_per_grid_ts, const c10::optional<at::Tensor>& attention_mask, const at::Tensor& position_ids, const at::Tensor& mrope_deltas, const at::Tensor& workspace, int spatial_merge_size, int image_token_id, int video_token_id, int vision_start_token_id, float tokens_per_second);
 int64_t GetRopeIndexGetWorkSpace(const c10::optional<at::Tensor>& input_ids, const c10::optional<at::Tensor>& image_grid_thw, const c10::optional<at::Tensor>& video_grid_thw);
@@ -17,6 +38,7 @@ void MRope(const at::Tensor& q, const at::Tensor& k, const at::Tensor& q_embed, 
 void MRopeInplace(const at::Tensor& q, const at::Tensor& k, const at::Tensor& cos, const at::Tensor& sin, const int first, const int second );
 void MRopeInplacePack(const at::Tensor& qkv, const at::Tensor& cos, const at::Tensor& sin, int64_t q_num_heads, int64_t kv_num_heads, const int first, const int second);
 void MRopeInplacePackBackward(const at::Tensor& dqkv, const at::Tensor& cos, const at::Tensor& sin, int64_t q_num_heads, int64_t kv_num_heads, const int first, const int second);
+void MRopeInplaceCfgCacheWrite(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const at::Tensor& cos, const at::Tensor& sin, const at::Tensor& kvcache, const at::Tensor& valid0, const at::Tensor& valid1, int64_t common_len, int64_t cond_tail_len, const int first, const int second);
 void MRopeBackward( const at::Tensor& grad_q_embed, const at::Tensor& grad_k_embed, const at::Tensor& grad_q, const at::Tensor& grad_k, const at::Tensor& cos, const at::Tensor& sin, const int first, const int second );
 }  // namespace wallx_cuda_m_rope
 
@@ -29,16 +51,32 @@ size_t CubSortPairGetStorageBytes(int64_t num_items);
 
 namespace wallx_cuda_rope {
 void Rope(const at::Tensor& q, const at::Tensor& k, const at::Tensor& q_embed, const at::Tensor& k_embed, const at::Tensor& cos, const at::Tensor& sin, bool interleave );
+void RopeFull(const at::Tensor& q, const at::Tensor& k, const at::Tensor& q_embed, const at::Tensor& k_embed, const at::Tensor& cos, const at::Tensor& sin, bool interleave, int64_t rotary_dim );
 void RopeInplace(const at::Tensor& q, const at::Tensor& k, const at::Tensor& cos, const at::Tensor& sin, bool interleave );
 void RopeInplacePack(const at::Tensor& qkv, const at::Tensor& cos, const at::Tensor& sin, int64_t q_num_heads, int64_t kv_num_heads, bool interleave);
 void RopeInplacePackBackward(const at::Tensor& dqkv, const at::Tensor& cos, const at::Tensor& sin, int64_t q_num_heads, int64_t kv_num_heads, bool interleave);
 void RopeBackward( const at::Tensor& grad_q_embed, const at::Tensor& grad_k_embed, const at::Tensor& grad_q, const at::Tensor& grad_k, const at::Tensor& cos, const at::Tensor& sin, bool interleave );
+void RopeFullBackward( const at::Tensor& grad_q_embed, const at::Tensor& grad_k_embed, const at::Tensor& grad_q, const at::Tensor& grad_k, const at::Tensor& cos, const at::Tensor& sin, bool interleave, int64_t rotary_dim );
 }  // namespace wallx_cuda_rope
 
 namespace wallx_cuda_rot_pos {
 void GetTokenCounts( const at::Tensor& grid_thw, const at::Tensor& token_counts, int spatial_merge_size );
 void RotPosEmb( const at::Tensor& inv_freq, const at::Tensor& grid_thw, const at::Tensor& output, const at::Tensor& cumsum_tokens, int spatial_merge_size );
 }  // namespace wallx_cuda_rot_pos
+
+namespace wallx_cuda_silu_and_mul {
+void SiluAndMul( const at::Tensor& output, const at::Tensor& input1, const at::Tensor& input2);
+void SiluAndMulBackward( const at::Tensor& grad_input1, const at::Tensor& grad_input2, const at::Tensor& grad_output, const at::Tensor& input1, const at::Tensor& input2);
+void SiluAndMulInplace( const at::Tensor& input1, const at::Tensor& input2);
+void SiluAndMulSplit( const at::Tensor& output, const at::Tensor& gate_up);
+void SiluAndMulSplitInplace(const at::Tensor& gate_up);
+void SiluAndMulSplitInplaceBackward( const at::Tensor& grad_gate_up, const at::Tensor& grad_output, const at::Tensor& gate_up);
+}  // namespace wallx_cuda_silu_and_mul
+
+namespace wallx_cuda_two_expert_scatter {
+void TwoExpertPack( const at::Tensor& output, const at::Tensor& input, const at::Tensor& action_starts, const at::Tensor& action_ends, const at::Tensor& llm_offsets, const at::Tensor& action_offsets);
+void TwoExpertUnpack( const at::Tensor& output, const at::Tensor& input, int64_t batch_size, int64_t seq_length, const at::Tensor& action_starts, const at::Tensor& action_ends, const at::Tensor& llm_offsets, const at::Tensor& action_offsets);
+}  // namespace wallx_cuda_two_expert_scatter
 
 namespace wallx_cuda_window_index {
 void GetWindowIndex( const at::Tensor& grid_thw, const at::Tensor& grid_info_tensor, const at::Tensor& window_indices, const at::Tensor& cu_window_seqlens, const at::Tensor& window_counts_tensor, int max_grid_t, int spatial_merge_size, int vit_merger_window_size, int patch_size, int spatial_merge_unit);
@@ -47,14 +85,17 @@ void GetTotals( const at::Tensor& grid_thw, const at::Tensor& grid_info_tensor, 
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rope", &wallx_cuda_rope::Rope);
+    m.def("rope_full", &wallx_cuda_rope::RopeFull);
     m.def("rope_inplace", &wallx_cuda_rope::RopeInplace);
     m.def("rope_inplace_pack", &wallx_cuda_rope::RopeInplacePack);
     m.def("rope_inplace_pack_bwd", &wallx_cuda_rope::RopeInplacePackBackward);
     m.def("rope_bwd", &wallx_cuda_rope::RopeBackward);
+    m.def("rope_full_bwd", &wallx_cuda_rope::RopeFullBackward);
     m.def("m_rope", &wallx_cuda_m_rope::MRope);
     m.def("m_rope_inplace", &wallx_cuda_m_rope::MRopeInplace);
     m.def("m_rope_inplace_pack", &wallx_cuda_m_rope::MRopeInplacePack);
     m.def("m_rope_inplace_pack_bwd", &wallx_cuda_m_rope::MRopeInplacePackBackward);
+    m.def("m_rope_inplace_cfg_cache_write", &wallx_cuda_m_rope::MRopeInplaceCfgCacheWrite);
     m.def("m_rope_bwd", &wallx_cuda_m_rope::MRopeBackward);
     m.def("get_token_counts", &wallx_cuda_rot_pos::GetTokenCounts);
     m.def("rot_pos", &wallx_cuda_rot_pos::RotPosEmb);
@@ -66,4 +107,30 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("unpermute", &wallx_cuda_permute::MoeRecoverTopKOp);
     m.def("unpermute_bwd", &wallx_cuda_permute::MoeRecoverTopKBwdOp);
     m.def("cub_sort_pair_get_storage_bytes", &wallx_cuda_permute::CubSortPairGetStorageBytes);
+    m.def("two_expert_pack", &wallx_cuda_two_expert_scatter::TwoExpertPack);
+    m.def("two_expert_unpack", &wallx_cuda_two_expert_scatter::TwoExpertUnpack);
+    m.def("rmsnorm", &tvm_ffi_rmsnorm::RMSNorm);
+    m.def("rmsnorm_zero_centered", &tvm_ffi_rmsnorm::RMSNormZeroCentered);
+    m.def("add_rmsnorm", &tvm_ffi_rmsnorm::AddRMSNorm);
+    m.def("add_rmsnorm_zero_centered", &tvm_ffi_rmsnorm::AddRMSNormZeroCentered);
+    m.def("add_rmsnorm_with_rstd", &tvm_ffi_rmsnorm::AddRMSNormWithRstd);
+    m.def("add_rmsnorm_zero_centered_with_rstd", &tvm_ffi_rmsnorm::AddRMSNormZeroCenteredWithRstd);
+    m.def("rmsnorm_backward", &tvm_ffi_rmsnorm::RMSNormBackward);
+    m.def("rmsnorm_zero_centered_backward", &tvm_ffi_rmsnorm::RMSNormZeroCenteredBackward);
+    m.def("add_rmsnorm_backward", &tvm_ffi_rmsnorm::AddRMSNormBackward);
+    m.def("add_rmsnorm_zero_centered_backward", &tvm_ffi_rmsnorm::AddRMSNormZeroCenteredBackward);
+    m.def("add_rmsnorm_backward_with_rstd", &tvm_ffi_rmsnorm::AddRMSNormBackwardWithRstd);
+    m.def("add_rmsnorm_zero_centered_backward_with_rstd", &tvm_ffi_rmsnorm::AddRMSNormZeroCenteredBackwardWithRstd);
+    m.def("gated_rmsnorm", &tvm_ffi_rmsnorm::GatedRMSNorm);
+    m.def("gated_rmsnorm_backward", &tvm_ffi_rmsnorm::GatedRMSNormBackward);
+    m.def("gated_rmsnorm_with_rstd", &tvm_ffi_rmsnorm::GatedRMSNormWithRstd);
+    m.def("gated_rmsnorm_backward_with_rstd", &tvm_ffi_rmsnorm::GatedRMSNormBackwardWithRstd);
+    m.def("adarmsnorm", &tvm_ffi_rmsnorm::AdaRMSNorm);
+    m.def("adarmsnorm_backward", &tvm_ffi_rmsnorm::AdaRMSNormBackward);
+    m.def("silu_and_mul", &wallx_cuda_silu_and_mul::SiluAndMul);
+    m.def("silu_and_mul_backward", &wallx_cuda_silu_and_mul::SiluAndMulBackward);
+    m.def("silu_and_mul_inplace", &wallx_cuda_silu_and_mul::SiluAndMulInplace);
+    m.def("silu_and_mul_split", &wallx_cuda_silu_and_mul::SiluAndMulSplit);
+    m.def("silu_and_mul_split_inplace", &wallx_cuda_silu_and_mul::SiluAndMulSplitInplace);
+    m.def("silu_and_mul_split_inplace_backward", &wallx_cuda_silu_and_mul::SiluAndMulSplitInplaceBackward);
 }

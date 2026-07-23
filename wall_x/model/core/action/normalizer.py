@@ -187,6 +187,34 @@ class Normalizer(nn.Module):
 
         return instance
 
+    @classmethod
+    def from_vectors(cls, min_by_key, delta_by_key):
+        """Build a Normalizer directly from precomputed per-dataset min/delta.
+
+        ``min_by_key`` / ``delta_by_key`` are ``{dataset_name: 1-D array/tensor}``
+        with matching keys. Used by :func:`create_normalizers_from_v2_stats` so
+        the model-side normalizer carries the exact statistics the
+        internal_dataset_backend_v2 pipeline used.
+        """
+        instance = cls.__new__(cls)
+        nn.Module.__init__(instance)
+
+        instance.min = nn.ParameterDict()
+        instance.delta = nn.ParameterDict()
+        instance.min_key = "min"
+        instance.delta_key = "delta"
+
+        for name, vec in min_by_key.items():
+            instance.min[name] = nn.Parameter(
+                torch.as_tensor(vec, dtype=torch.float32), requires_grad=False
+            )
+        for name, vec in delta_by_key.items():
+            instance.delta[name] = nn.Parameter(
+                torch.as_tensor(vec, dtype=torch.float32), requires_grad=False
+            )
+
+        return instance
+
     def __init__(
         self,
         action_statistic_dof,
@@ -206,31 +234,36 @@ class Normalizer(nn.Module):
             action_statistic[robot_name] = {}
             all_dof_min = []
             all_dof_delta = []
-            for k in dof_config:
+            for config_key, dof_dim in dof_config.items():
+                # Use a fallback stats key without mutating the model dof key.
+                stat_key = config_key
+                follow_key = config_key.replace("master_", "follow_", 1)
                 if (
-                    k not in action_statistic_dof[robot_name]
-                    and k.replace("master_", "follow_", 1)
-                    in action_statistic_dof[robot_name]
+                    stat_key not in action_statistic_dof[robot_name]
+                    and follow_key in action_statistic_dof[robot_name]
                 ):
-                    k = k.replace("master_", "follow_", 1)
-                if k in action_statistic_dof[robot_name]:
+                    stat_key = follow_key
+
+                if stat_key in action_statistic_dof[robot_name]:
                     if (
-                        min_key in action_statistic_dof[robot_name][k]
-                        and delta_key in action_statistic_dof[robot_name][k]
+                        min_key in action_statistic_dof[robot_name][stat_key]
+                        and delta_key in action_statistic_dof[robot_name][stat_key]
                     ):
-                        all_dof_min.extend(action_statistic_dof[robot_name][k][min_key])
+                        all_dof_min.extend(
+                            action_statistic_dof[robot_name][stat_key][min_key]
+                        )
                         all_dof_delta.extend(
-                            action_statistic_dof[robot_name][k][delta_key]
+                            action_statistic_dof[robot_name][stat_key][delta_key]
                         )
                     else:
                         normalizer_missing_information.append(
-                            f"Normalizer (Warning): min_key {min_key} or delta_key {delta_key} not in action_statistic_dof[{robot_name}][{k}], use default min 0.0 and delta 1.0"
+                            f"Normalizer (Warning): min_key {min_key} or delta_key {delta_key} not in action_statistic_dof[{robot_name}][{stat_key}], use default min 0.0 and delta 1.0"
                         )
-                        all_dof_min.extend([0.0] * dof_config[k])
-                        all_dof_delta.extend([1.0] * dof_config[k])
+                        all_dof_min.extend([0.0] * dof_dim)
+                        all_dof_delta.extend([1.0] * dof_dim)
                 else:
-                    # k is a model key; action_statistic_dof may store raw keys - try fallback lookup
-                    raw_key = _MODEL_KEY_TO_RAW_KEY.get(k)
+                    # config_key is a model key; action_statistic_dof may store raw keys.
+                    raw_key = _MODEL_KEY_TO_RAW_KEY.get(config_key)
                     if (
                         raw_key is not None
                         and raw_key in action_statistic_dof[robot_name]
@@ -241,16 +274,16 @@ class Normalizer(nn.Module):
                             all_dof_delta.extend(stat[delta_key])
                         else:
                             normalizer_missing_information.append(
-                                f"Normalizer (Warning): Action {k} not in action_statistic_dof for {robot_name}, use default min 0.0 and delta 1.0"
+                                f"Normalizer (Warning): Action {config_key} not in action_statistic_dof for {robot_name}, use default min 0.0 and delta 1.0"
                             )
-                            all_dof_min.extend([0.0] * dof_config[k])
-                            all_dof_delta.extend([1.0] * dof_config[k])
+                            all_dof_min.extend([0.0] * dof_dim)
+                            all_dof_delta.extend([1.0] * dof_dim)
                     else:
                         normalizer_missing_information.append(
-                            f"Normalizer (Warning): Action {k} not in action_statistic_dof for {robot_name}, use default min 0.0 and delta 1.0"
+                            f"Normalizer (Warning): Action {config_key} not in action_statistic_dof for {robot_name}, use default min 0.0 and delta 1.0"
                         )
-                        all_dof_min.extend([0.0] * dof_config[k])
-                        all_dof_delta.extend([1.0] * dof_config[k])
+                        all_dof_min.extend([0.0] * dof_dim)
+                        all_dof_delta.extend([1.0] * dof_dim)
             all_dof_min = torch.tensor(all_dof_min)
             all_dof_delta = torch.tensor(all_dof_delta)
             action_statistic[robot_name][min_key] = all_dof_min
@@ -344,48 +377,6 @@ def _pad_lerobot_stats(stats, target_dim, label):
     return type(stats)(min=min_stat, max=max_stat, delta=delta)
 
 
-def pad_normalizer_to_dim(normalizer, target_dim, label):
-    """Tail-pad every dataset entry to ``target_dim`` (virtual ``action_padding`` tail)."""
-    target_dim = int(target_dim)
-    for name in list(normalizer.min.keys()):
-        current_dim = int(normalizer.min[name].numel())
-        if current_dim == target_dim:
-            continue
-        if current_dim > target_dim:
-            raise ValueError(
-                f"Normalizer {label}[{name!r}] dim ({current_dim}) exceeds configured "
-                f"{label} dim ({target_dim})"
-            )
-
-        pad_dim = target_dim - current_dim
-        dtype = normalizer.min[name].dtype
-        normalizer.min[name] = nn.Parameter(
-            torch.cat(
-                [
-                    normalizer.min[name].flatten(),
-                    torch.zeros(pad_dim, dtype=dtype),
-                ]
-            ),
-            requires_grad=False,
-        )
-        normalizer.delta[name] = nn.Parameter(
-            torch.cat(
-                [
-                    normalizer.delta[name].flatten(),
-                    torch.ones(pad_dim, dtype=dtype),
-                ]
-            ),
-            requires_grad=False,
-        )
-        logger.info(
-            "Padded %s normalizer[%r] from %d to %d dims",
-            label,
-            name,
-            current_dim,
-            target_dim,
-        )
-
-
 def create_normalizers_from_lerobot_norm_stats(
     norm_stats, dataset_name, action_dim, propri_dim
 ):
@@ -405,20 +396,21 @@ def create_normalizers(config, action_statistic_dof=None):
     Public Wall-X builds intentionally do not bundle private default stats.
     """
 
+    norm_cfg = config.get("normalizer_config") or {}
     if action_statistic_dof is None:
-        custom_path = config.get("customized_action_statistic_dof")
+        custom_path = norm_cfg.get("customized_action_statistic_dof")
         if custom_path:
             with open(custom_path, "r") as f:
                 action_statistic_dof = json.load(f)
         else:
             raise ValueError(
                 "create_normalizers requires action statistics. Provide "
-                "`customized_action_statistic_dof` in the config or pass "
-                "`action_statistic_dof` from the checkpoint/dataset."
+                "`customized_action_statistic_dof` in data.normalizer_config or "
+                "pass `action_statistic_dof` from the checkpoint/dataset."
             )
 
-    min_key = config.get("min_key", "min")
-    delta_key = config.get("delta_key", "delta")
+    min_key = norm_cfg.get("min_key", "min")
+    delta_key = norm_cfg.get("delta_key", "delta")
 
     # Required keys for constructing action/proprio normalizers.
     missing_required = []
@@ -445,3 +437,148 @@ def create_normalizers(config, action_statistic_dof=None):
         delta_key=delta_key,
     )
     return normalizer_action, normalizer_propri, action_statistic_dof
+
+
+NORM_KEY_SEP = "/"
+V2_DEFAULT_MIN_KEY = "q001"
+V2_DEFAULT_DELTA_KEY = "delta_001"
+
+
+def make_norm_key(dataset_type, end_effector_type=None):
+    """Compose the model/serving normalizer key from a ``(dataset_type,
+    end_effector_type)`` pair.
+
+    Returns the bare ``dataset_type`` when there is no end_effector_type
+    (flat/legacy stats, e.g. lerobot / x2robot_v1).
+    """
+    if end_effector_type is None or end_effector_type == "":
+        return dataset_type
+    return f"{dataset_type}{NORM_KEY_SEP}{end_effector_type}"
+
+
+def _list_v2_end_effector_types(ds_stats, min_key, delta_key):
+    """List the end_effector_type levels under one dataset_type.
+
+    Returns ``[ee_type, ...]`` for the two-level layout
+    ``stats[dataset_type][end_effector_type][action_key]`` (one or many), or
+    ``[None]`` when the layout is flat (one-level).
+    """
+    if not isinstance(ds_stats, dict) or not ds_stats:
+        return [None]
+
+    def _is_stat_leaf(d):
+        return isinstance(d, dict) and (
+            min_key in d or delta_key in d or "min" in d or "q001" in d
+        )
+
+    children = list(ds_stats.values())
+    if any(_is_stat_leaf(c) for c in children):
+        return [None]  # flat / legacy one-level layout
+    return list(ds_stats.keys())
+
+
+def normalizer_is_identity(normalizer):
+    """True if every dataset entry is the identity transform (min==0, delta==1)."""
+    min_dict = getattr(normalizer, "min", None)
+    delta_dict = getattr(normalizer, "delta", None)
+    if not min_dict or not delta_dict:
+        return False
+    for k in min_dict.keys():
+        if not torch.allclose(min_dict[k], torch.zeros_like(min_dict[k])):
+            return False
+        if k in delta_dict and not torch.allclose(
+            delta_dict[k], torch.ones_like(delta_dict[k])
+        ):
+            return False
+    return True
+
+
+def create_normalizers_from_v2_stats(config):
+    """Build wall-x ``Normalizer`` whose min/delta come from internal_dataset_backend_v2.
+
+    Single source of truth for ``dataset_type == x2robot_v2`` checkpoints: the
+    statistics are resolved by v2's own ``MinMaxNormalizer`` (two-level
+    ``dataset_type/end_effector_type`` lookup, ``master_``->``follow_`` fallback,
+    ``key_dims`` truncation), so the model-side normalizer stays bit-exact with
+    what the v2 dataset pipeline applied during training. The wall-x
+    ``normalize_data`` / ``unnormalize_data`` math is identical to v2's
+    (``(x-min)/delta*2-1`` / ``(x+1)/2*delta+min``), so feeding v2-derived
+    min/delta reproduces training normalization exactly.
+
+    The resulting ``Normalizer`` is keyed by the composite
+    ``make_norm_key(dataset_type, end_effector_type)`` (= ``dataset_type/ee_type``
+    for two-level stats, bare ``dataset_type`` for flat stats). A dataset_type
+    with several end_effector_types yields one entry each, so a single checkpoint
+    can serve any of them; serving selects via ``InferConfig.end_effector_type``
+    or an unambiguous bare ``norm_key`` (see ``_resolve_norm_key``).
+
+    Expected ``config`` keys: ``dof_config`` (action keys+dims, order = model
+    action layout), ``agent_pos_config`` (proprio keys+dims), ``stats_file`` (or
+    ``customized_action_statistic_dof``), ``min_key`` (default ``q001``),
+    ``delta_key`` (default ``delta_001``); plus any extra v2 ``normalizer_config``
+    fields, which are forwarded to ``build_action_normalizer`` verbatim. Returns
+    ``(normalizer_action, normalizer_propri, None)`` to match
+    :func:`create_normalizers`.
+    """
+    from internal_dataset_backend_v2.common.normalizer import build_action_normalizer
+
+    stats_file = config.get("stats_file") or config.get(
+        "customized_action_statistic_dof"
+    )
+    if not stats_file:
+        raise ValueError(
+            "create_normalizers_from_v2_stats requires 'stats_file' "
+            "(or 'customized_action_statistic_dof')."
+        )
+    dof_config = config["dof_config"]
+    agent_pos_config = config["agent_pos_config"]
+    min_key = config.get("min_key", V2_DEFAULT_MIN_KEY)
+    delta_key = config.get("delta_key", V2_DEFAULT_DELTA_KEY)
+
+    # Forward any extra v2 normalizer_config fields verbatim so the bridge uses
+    # the exact same normalizer config the dataset pipeline used; force the
+    # stats source / keys we resolved above.
+    reserved = {
+        "dof_config",
+        "agent_pos_config",
+        "stats_file",
+        "customized_action_statistic_dof",
+    }
+    v2_cfg = {k: v for k, v in config.items() if k not in reserved}
+    v2_cfg.setdefault("type", "min_max")
+    v2_cfg["stats_file"] = stats_file
+    v2_cfg["min_key"] = min_key
+    v2_cfg["delta_key"] = delta_key
+
+    # key_dims feeds v2's authoritative fallback dim. Action+proprio keys that
+    # collide must share the same dim (true for the v2 configs in use).
+    key_dims = {**dof_config, **agent_pos_config}
+    v2norm = build_action_normalizer(v2_cfg, key_dims=key_dims)
+
+    action_keys = list(dof_config.keys())
+    propri_keys = list(agent_pos_config.keys())
+
+    with open(stats_file, "r") as f:
+        raw_stats = json.load(f)
+
+    get_vecs = getattr(v2norm, "get_min_delta_vectors", None) or v2norm._get_params
+
+    action_min, action_delta = {}, {}
+    propri_min, propri_delta = {}, {}
+    for dataset_type, ds_stats in raw_stats.items():
+        # A dataset_type may carry several end_effector_types (e.g. the same data
+        # collected with different hands). Build one entry per (dataset_type,
+        # end_effector_type), keyed by the composite ``dataset_type/ee_type`` so a
+        # single checkpoint can serve any of them. Two-level stats always use the
+        # composite key (even with a single ee_type); flat stats stay bare.
+        eets = _list_v2_end_effector_types(ds_stats, min_key, delta_key)
+        for eet in eets:
+            a_min, a_delta = get_vecs(action_keys, dataset_type, end_effector_type=eet)
+            p_min, p_delta = get_vecs(propri_keys, dataset_type, end_effector_type=eet)
+            key = make_norm_key(dataset_type, eet)
+            action_min[key], action_delta[key] = a_min, a_delta
+            propri_min[key], propri_delta[key] = p_min, p_delta
+
+    normalizer_action = Normalizer.from_vectors(action_min, action_delta)
+    normalizer_propri = Normalizer.from_vectors(propri_min, propri_delta)
+    return normalizer_action, normalizer_propri, None

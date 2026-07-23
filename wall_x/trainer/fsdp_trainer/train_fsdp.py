@@ -9,17 +9,16 @@ import dataclasses
 import logging
 import os
 import sys
-from datetime import datetime
-
 import torch
-import wandb
-
+from datetime import datetime
 from wall_x.config.loader import load_config as load_typed_config
 from wall_x.trainer.fsdp_trainer import (
     FSDPTrainer,
     cleanup_distributed,
     is_main_process,
 )
+from wall_x.distributed import init_sequence_parallel, destroy_parallel_groups
+import wandb
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +53,13 @@ def parse_args():
         "--fsdp_sharding_strategy",
         type=str,
         default=None,
-        choices=["full_shard", "shard_grad_op", "no_shard", "hybrid_shard"],
-        help="FSDP sharding strategy (overrides config)",
+        choices=[
+            "full_shard",
+            "shard_grad_op",
+            "hybrid_shard",
+            "_hybrid_shard_zero2",
+        ],
+        help="Legacy sharding strategy override for the active distributed backend",
     )
     parser.add_argument(
         "--debug",
@@ -117,8 +121,11 @@ def print_fsdp_config(cfg):
     if is_main_process():
         dist = cfg.distributed
         logger.info("%s", "=" * 60)
-        logger.info("FSDP Configuration:")
-        logger.info("  use_fsdp: %s", dist.use_fsdp)
+        logger.info("Distributed Configuration:")
+        logger.info("  backend: %s", dist.backend)
+        active = dist.dmuon if dist.backend == "dmuon" else dist.fsdp
+        logger.info("  sharding_strategy: %s", active.sharding_strategy)
+        logger.info("  hsdp_replicate_size: %s", active.hsdp_replicate_size)
         logger.info("%s", "=" * 60)
 
 
@@ -151,12 +158,18 @@ def main():
     else:
         logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
 
+    # Determinism (incl. the cublas workspace pin) is config-driven and applied
+    # in seed_all() from hyperparams.deterministic_algorithms.
     torch.cuda.init()
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
     torch.distributed.init_process_group("nccl", device_id=device)
     cfg = load_config(args.config, cli_args=args)
+    # Build SP + DP process groups before the FSDP2 device mesh (constructed in
+    # FSDPTrainer). Called unconditionally so get_dp_rank()/get_dp_world_size()
+    # are valid even when sp_size==1 (the data sampler reads them).
+    init_sequence_parallel(cfg.distributed.sp_size)
     wandb_run = setup_logger(cfg)
     print_fsdp_config(cfg)
 
@@ -172,6 +185,7 @@ def main():
         raise
 
     finally:
+        destroy_parallel_groups()
         cleanup_distributed()
         if wandb_run is not None:
             wandb_run.finish()

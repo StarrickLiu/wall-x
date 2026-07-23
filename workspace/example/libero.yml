@@ -62,6 +62,11 @@ model:
 
 hyperparams:
   num_epoch: 100
+  # Throughput note: the fused CUDA kernels (rmsnorm, silu, m_rope, MoE
+  # pack/unpack, ...) are compiled at install time and used automatically.
+  # To push training MFU on 80GB GPUs, raise batch_size_per_gpu (e.g. 24-36),
+  # bump data.num_workers (e.g. 8), and keep distributed.fsdp_sharding_strategy
+  # at shard_grad_op (below). The conservative defaults here run on modest GPUs.
   batch_size_per_gpu: 4
   gradient_accumulation_steps: 4
   seed: 10222
@@ -83,6 +88,12 @@ distributed:
   use_fsdp: true
   use_mixed_precision: true
   bf16: true
+  # ZeRO-2: replicate params, shard only gradients + optimizer state. This
+  # skips the per-layer parameter all-gather that the full_shard (ZeRO-3)
+  # default pays every step, so throughput/MFU is substantially higher. Safe
+  # for the 3B model on any >=24GB GPU (replicated params are ~6GB in bf16).
+  # Switch to "full_shard" only if you OOM (many GPUs + very large batch).
+  fsdp_sharding_strategy: shard_grad_op
 
 data:
   dataset_type: lerobot

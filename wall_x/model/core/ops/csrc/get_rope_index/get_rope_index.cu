@@ -129,7 +129,7 @@ __global__ void compute_vision_counts(
 }
 
 
-// Stage 2: Preprocessing kernel - parse and analyze all vision content
+// Stage 2: Preprocessing kernel – parse and analyze all vision content
 __global__ void preprocess_vision_tokens(
     const int64_t *input_ids,            // (batch_size, seq_len)
     const int64_t *attention_mask,       // (batch_size, seq_len)
@@ -276,7 +276,7 @@ __global__ void preprocess_vision_tokens(
 }
 
 
-// Stage 3: Main kernel - compute 3D position IDs for all tokens in parallel
+// Stage 3: Main kernel – compute 3D position IDs for all tokens in parallel
 __global__ void compute_3d_positions(
     const int64_t *input_ids,                // (batch_size, seq_len)
     const int64_t *attention_mask,           // (batch_size, seq_len)
@@ -284,8 +284,8 @@ __global__ void compute_3d_positions(
     const int64_t *vision_counts,            // (batch_size,)
     const int64_t *text_lengths,             // (batch_size, MAX_VISION_TOKENS+1)
     const int64_t *position_offsets,         // (batch_size, MAX_VISION_TOKENS+1)
-    int64_t *position_ids,                   // (3, batch_size, seq_len) - output 3D position IDs
-    int64_t *mrope_deltas,                   // (batch_size,) - RoPE length adjustment
+    int64_t *position_ids,                   // (3, batch_size, seq_len) — output 3D position IDs
+    int64_t *mrope_deltas,                   // (batch_size,) — RoPE length adjustment
     const int64_t batch_size,
     const int64_t seq_len,
     const float tokens_per_second)
@@ -443,7 +443,7 @@ __global__ void compute_3d_positions(
 // Fallback kernel when no vision tokens exist: assign sequential positions based on attention mask
 __global__ void compute_3d_positions_mask_text(
     const int64_t* __restrict__ attention_mask,   // (batch_size, seq_len)
-    int64_t* __restrict__ position_ids,           // (3, batch_size, seq_len) - flattened row-major
+    int64_t* __restrict__ position_ids,           // (3, batch_size, seq_len) — flattened row-major
     int64_t* __restrict__ mrope_deltas,           // (batch_size,)
     const int64_t batch_size,
     const int64_t seq_len
@@ -466,7 +466,7 @@ __global__ void compute_3d_positions_mask_text(
     int64_t total_valid = 0;
 
     // Compute prefix sum (cumulative count of valid tokens)
-    // Simple O(seq_len^2) per-thread loop - acceptable for moderate seq_len
+    // Simple O(seq_len^2) per-thread loop — acceptable for moderate seq_len
     for (int idx = tid; idx < seq_len; idx += blockDim.x) {
         int64_t sum = 0;
         for (int i = 0; i <= idx; ++i) {
@@ -511,7 +511,7 @@ __global__ void arange_3d(int64_t seq_len,
         return;
     }
 
-    // Flatten index: (dim, batch, token) -> linear
+    // Flatten index: (dim, batch, token) → linear
     int64_t idx = i * gridDim.y * seq_len + j * seq_len + k;
     out[idx] = k;
 }
@@ -605,7 +605,7 @@ void GetRopeIndex(const c10::optional<at::Tensor>& input_ids,
     cudaStream_t stream = static_cast<cudaStream_t>(
         at::cuda::getCurrentCUDAStream().stream());
 
-    // Case: no vision tokens -> use simple positional encoding
+    // Case: no vision tokens → use simple positional encoding
     if (!image_grid_thw.has_value() && !video_grid_thw.has_value()) {
         if (attention_mask.has_value()) {
             // Use attention mask to compute valid positions
@@ -619,7 +619,7 @@ void GetRopeIndex(const c10::optional<at::Tensor>& input_ids,
             );
             return;
         } else {
-            // No mask, no vision -> use simple arange
+            // No mask, no vision → use simple arange
             dim3 thread_num(256);
             dim3 grid(3, batch_size, (seq_len + 255) / 256);
             arange_3d<<<grid, thread_num, 0, stream>>>(seq_len, static_cast<int64_t*>(position_ids.data_ptr()));

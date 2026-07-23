@@ -273,29 +273,22 @@ bash scripts/run_serving.sh \
   --port 32195
 ```
 
-By default this wrapper returns raw model action chunks, which is the expected
-mode for open-loop evaluation. Pass `--serialize-actions` if your client expects
-robot-serialized actions.
+This (vanilla) server returns raw model action chunks — the expected mode for
+open-loop evaluation. Robot-side serialization/interpolation is left to the
+client, since the real-robot preprocessors are not part of the open-source cut.
 
 Or invoke the serving module directly (adjust parameters as needed):
 
 ```bash
-export ENABLE_CUDA_GRAPH=True
-export ENABLE_EXPERIMENTAL_INFERENCE_ENGINE=True
-
 CKPT_PATH=/path/to/checkpoint
 
-python -m wall_x._vendor.harrix.serving.launch_serving \
-  --env X2ROBOT \
+python -m wall_x._vendor.harrix.serving.launch_vanilla_serving \
+  --checkpoint-path "$CKPT_PATH" \
+  --train-config-path /path/to/my_robot_config.yml \
   --port 32195 \
-  --no-serialize-actions \
-  model-config:server-model-config \
-  --model-config.checkpoint-path "$CKPT_PATH" \
-  --model-config.train-config-path /path/to/my_robot_config.yml \
-  --model-config.action-horizon 32 \
-  --model-config.robot-action-interpolate-multiplier 1 \
-  --model-config.robot-action-end-ratio 1.0 \
-  --model-config.robot-type desktop
+  --action-horizon 32 \
+  --cam-names face_view right_wrist_view \
+  --image-passing-mode base64
 ```
 
 Clients connect at `ws://127.0.0.1:32195` to send observations and receive predicted actions.

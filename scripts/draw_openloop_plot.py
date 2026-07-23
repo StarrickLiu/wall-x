@@ -7,16 +7,13 @@ ground-truth trajectories.
 
 Reference: ``infer_openloop_websocket.py`` (websocket client + open-loop loop).
 
-For single-arm LIBERO checkpoints, start the server with raw model output::
+For single-arm LIBERO checkpoints, start the vanilla server (raw model output)::
 
-    python -m wall_x._vendor.harrix.serving.launch_serving \\
-      --env X2ROBOT --port 32194 \\
-      --no-serialize-actions \\
-      model-config:server-model-config \\
-      --model-config.checkpoint-path /path/to/ckpt \\
-      --model-config.train-config-path /path/to/libero.yml \\
-      --model-config.action-horizon 10 \\
-      --model-config.robot-type desktop
+    bash scripts/run_serving.sh \\
+      --checkpoint-path /path/to/ckpt \\
+      --train-config-path /path/to/libero.yml \\
+      --action-horizon 10 \\
+      --port 32194
 """
 
 from __future__ import annotations
@@ -361,15 +358,9 @@ def decode_predict_action(
         if parts:
             return np.concatenate(parts, axis=1).astype(np.float32)
 
-    try:
-        from wall_x._vendor.harrix.envs.libero_common import decode_chunk
-
-        chunk = decode_chunk(pa, train_config)
-        if chunk.ndim == 2 and chunk.shape[1] > 0:
-            return chunk.astype(np.float32)
-    except Exception:
-        pass
-
+    # No dof_config available: fall back to the raw model action rows. (The
+    # primary path above already drops the virtual action_padding tail, which is
+    # the OSS-correct decode.)
     return pa.astype(np.float32)
 
 

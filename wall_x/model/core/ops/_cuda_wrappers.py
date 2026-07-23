@@ -56,6 +56,56 @@ class _RopeFunction(Function):
         return grad_q, grad_k, None, None, None, None, None
 
 
+class _RopeFullFunction(Function):
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        cos,
+        sin,
+        interleave,
+        rotary_dim,
+        fwd_kernel=None,
+        bwd_kernel=None,
+    ):
+        if q.stride(-1) != 1:
+            q = q.contiguous()
+        if k.stride(-1) != 1:
+            k = k.contiguous()
+        q_embed = q.new_empty(q.shape)
+        k_embed = k.new_empty(k.shape)
+        ctx.save_for_backward(cos, sin)
+        ctx.interleave = interleave
+        ctx.rotary_dim = rotary_dim
+        ctx.bwd_kernel = bwd_kernel
+        fwd_kernel(q, k, q_embed, k_embed, cos, sin, interleave, rotary_dim)
+        return q_embed, k_embed
+
+    @staticmethod
+    def backward(ctx, grad_q_embed, grad_k_embed):
+        if grad_q_embed is None or grad_k_embed is None:
+            return None, None, None, None, None, None, None, None
+        if grad_q_embed.stride(-1) != 1:
+            grad_q_embed = grad_q_embed.contiguous()
+        if grad_k_embed.stride(-1) != 1:
+            grad_k_embed = grad_k_embed.contiguous()
+        cos, sin = ctx.saved_tensors
+        grad_q = grad_q_embed.new_empty(grad_q_embed.shape)
+        grad_k = grad_k_embed.new_empty(grad_k_embed.shape)
+        ctx.bwd_kernel(
+            grad_q_embed,
+            grad_k_embed,
+            grad_q,
+            grad_k,
+            cos,
+            sin,
+            ctx.interleave,
+            ctx.rotary_dim,
+        )
+        return grad_q, grad_k, None, None, None, None, None, None
+
+
 class _RopePackFunction(Function):
     @staticmethod
     def forward(
@@ -102,10 +152,12 @@ class Rope:
     def __init__(self):
         pass
         self.fwd_kernel = _m().rope
+        self.full_kernel = _m().rope_full
         self.inplace_kernel = _m().rope_inplace
         self.pack_kernel = _m().rope_inplace_pack
         self.pack_bwd_kernel = _m().rope_inplace_pack_bwd
         self.bwd_kernel = _m().rope_bwd
+        self.full_bwd_kernel = _m().rope_full_bwd
 
     def pack(
         self,
@@ -117,11 +169,11 @@ class Rope:
         interleave=False,
         inference=False,
     ):
-        """packed qkvq/krope,qkv.
+        """原地对packed qkv的q/k部分应用rope，并返回同一个qkv张量。
 
         Split/view/offset calculations are done on the C++ side. Callers consume qkv through the paired
         flash_attn pack interface without splitting q/k/v in Python.
-        autograd,backwarddqkvdq/dk.
+        训练路径支持autograd，backward会原地更新dqkv中的dq/dk部分。
 
         Args:
             qkv:          [seq_len, q_dim + 2*kv_dim]
@@ -129,7 +181,7 @@ class Rope:
             kv_num_heads: number of key/value heads
             cos, sin:     rotary position encoding [1, seq_len, head_dim/2]
             interleave:   whether to use interleaved RoPE
-            inference:    kernel,autograd
+            inference:    只执行前向原地kernel，不接入autograd
         """
         if inference:
             self.pack_kernel(qkv, cos, sin, q_num_heads, kv_num_heads, interleave)
@@ -149,9 +201,29 @@ class Rope:
     def pack_backward(
         self, dqkv, q_num_heads, kv_num_heads, cos, sin, interleave=False
     ):
-        """packed dqkvdq/dkrope backward,dqkv."""
+        """原地对packed dqkv的dq/dk部分应用rope backward，并返回dqkv。"""
         self.pack_bwd_kernel(dqkv, cos, sin, q_num_heads, kv_num_heads, interleave)
         return dqkv
+
+    def full(self, q, k, cos, sin, interleave=False, rotary_dim=None):
+        """Apply RoPE to the rotary prefix and return full-head q/k outputs.
+
+        This preserves the existing ``rope(q_rot, k_rot, ...)`` API while
+        avoiding Python-side ``torch.cat([rotated, pass_through], dim=-1)`` for
+        partial rotary embeddings.
+        """
+        if rotary_dim is None:
+            rotary_dim = cos.shape[-1] * 2
+        return _RopeFullFunction.apply(
+            q,
+            k,
+            cos,
+            sin,
+            interleave,
+            int(rotary_dim),
+            self.full_kernel,
+            self.full_bwd_kernel,
+        )
 
     def __call__(self, q, k, cos, sin, interleave=False, inference=False):
         if inference:
@@ -275,6 +347,7 @@ class MRope:
         self.inplace_kernel = _m().m_rope_inplace
         self.pack_kernel = _m().m_rope_inplace_pack
         self.pack_bwd_kernel = _m().m_rope_inplace_pack_bwd
+        self.cfg_cache_write_kernel = _m().m_rope_inplace_cfg_cache_write
         self.bwd_kernel = _m().m_rope_bwd
 
     def pack(
@@ -287,7 +360,7 @@ class MRope:
         mrope_section,
         inference=False,
     ):
-        """packed qkvq/kmrope,qkv.GQA.
+        """原地对packed qkv的q/k部分应用mrope，并返回同一个qkv张量。支持GQA。
 
         Split/view/offset calculations are done on the C++ side. qkv must be 3D: [bz, seq_len, q_dim+2*kv_dim].
 
@@ -297,7 +370,7 @@ class MRope:
             kv_num_heads: number of key/value heads
             cos, sin:     rotary position encoding [3, bz, seq_len, head_dim/2]
             mrope_section: (first, second) M-RoPE section parameters
-            inference:     kernel,autograd
+            inference:     只执行前向原地kernel，不接入autograd
         """
         if inference:
             self.pack_kernel(
@@ -323,7 +396,7 @@ class MRope:
         )
 
     def pack_backward(self, dqkv, q_num_heads, kv_num_heads, cos, sin, mrope_section):
-        """packed dqkvdq/dkmrope backward,dqkv."""
+        """原地对packed dqkv的dq/dk部分应用mrope backward，并返回dqkv。"""
         self.pack_bwd_kernel(
             dqkv,
             cos,
@@ -334,6 +407,42 @@ class MRope:
             mrope_section[1],
         )
         return dqkv
+
+    def cfg_cache_write(
+        self,
+        q,
+        k,
+        v,
+        cos,
+        sin,
+        mrope_section,
+        kvcache,
+        valid0,
+        valid1,
+        common_len,
+        cond_tail_len,
+    ):
+        """In-place mrope(q, k) fused with CFG packed prefill KV-cache write.
+
+        This is inference-only. `q`, `k`, and `v` are packed single-batch
+        tensors [1, packed_seq, heads, head_dim]. `kvcache` is the per-layer
+        static cache view [2, max_batch, max_len, kv_heads, head_dim].
+        """
+        self.cfg_cache_write_kernel(
+            q,
+            k,
+            v,
+            cos,
+            sin,
+            kvcache,
+            valid0,
+            valid1,
+            int(common_len),
+            int(cond_tail_len),
+            mrope_section[0],
+            mrope_section[1],
+        )
+        return q, k
 
     def __call__(self, q, k, cos, sin, mrope_section, inference=False):
         if inference:
@@ -359,7 +468,9 @@ class RotPos:
     def __init__(self):
         pass
 
-    def __call__(self, inv_freq, grid_thw, spatial_merge_size):
+    def __call__(
+        self, inv_freq, grid_thw, spatial_merge_size, total_output_tokens=None
+    ):
         assert (
             inv_freq.dtype == torch.float32
         ), f"Expected float32, got {inv_freq.dtype}"
@@ -380,8 +491,11 @@ class RotPos:
             dim=0,
         ).to(grid_thw.dtype)
 
+        if total_output_tokens is None:
+            total_output_tokens = cumsum_tokens[-1].item()
+
         output = torch.empty(
-            (cumsum_tokens[-1].item(), inv_freq.size(0) * 2),
+            (total_output_tokens, inv_freq.size(0) * 2),
             dtype=torch.float,
             device=inv_freq.device,
         )
@@ -748,3 +862,629 @@ def permute_kernel(input_act, indices, num_out_tokens=None, max_token_num=0):
 
 def unpermute_kernel(input_act, row_id_map, probs=None):
     return UnpermuteMoE_topK.apply(input_act, row_id_map, probs)
+
+
+
+
+
+def _check_index_tensor(
+    tensor: torch.Tensor,
+    name: str,
+    *,
+    expected_size: int,
+    device: torch.device,
+):
+    if not isinstance(tensor, torch.Tensor):
+        raise RuntimeError(f"{name} must be a tensor")
+    if tensor.dim() != 1:
+        raise RuntimeError(f"{name} must have shape [{expected_size}]")
+    if tensor.numel() != expected_size:
+        raise RuntimeError(
+            f"{name} size mismatch: got {tensor.numel()}, expected {expected_size}"
+        )
+    if tensor.dtype != torch.int64:
+        raise RuntimeError(f"{name} must be int64")
+    if tensor.device != device:
+        raise RuntimeError(f"{name} must be on the same device as input")
+    if not tensor.is_contiguous():
+        raise RuntimeError(f"{name} must be contiguous")
+
+
+def _check_layout_tensors(
+    action_starts: torch.Tensor,
+    action_ends: torch.Tensor,
+    llm_offsets: torch.Tensor,
+    action_offsets: torch.Tensor,
+    *,
+    batch_size: int,
+    device: torch.device,
+):
+    _check_index_tensor(
+        action_starts,
+        "action_starts",
+        expected_size=batch_size,
+        device=device,
+    )
+    _check_index_tensor(
+        action_ends,
+        "action_ends",
+        expected_size=batch_size,
+        device=device,
+    )
+    _check_index_tensor(
+        llm_offsets,
+        "llm_offsets",
+        expected_size=batch_size + 1,
+        device=device,
+    )
+    _check_index_tensor(
+        action_offsets,
+        "action_offsets",
+        expected_size=batch_size + 1,
+        device=device,
+    )
+
+
+class _TwoExpertPack(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        input_act: torch.Tensor,
+        action_starts: torch.Tensor,
+        action_ends: torch.Tensor,
+        llm_offsets: torch.Tensor,
+        action_offsets: torch.Tensor,
+    ):
+        if input_act.is_cpu:
+            raise RuntimeError("two_expert_pack expects a CUDA tensor")
+        if input_act.dim() != 3:
+            raise RuntimeError("two_expert_pack expects input shape [B, S, D]")
+
+        batch_size, seq_length, hidden_dim = input_act.shape
+        _check_layout_tensors(
+            action_starts,
+            action_ends,
+            llm_offsets,
+            action_offsets,
+            batch_size=batch_size,
+            device=input_act.device,
+        )
+
+        if not input_act.is_contiguous():
+            input_act = input_act.contiguous()
+
+        output = torch.empty(
+            (batch_size * seq_length, hidden_dim),
+            dtype=input_act.dtype,
+            device=input_act.device,
+        )
+        _m().two_expert_pack(
+            output, input_act, action_starts, action_ends, llm_offsets, action_offsets
+        )
+
+        ctx.batch_size = batch_size
+        ctx.seq_length = seq_length
+        ctx.save_for_backward(action_starts, action_ends, llm_offsets, action_offsets)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        if not ctx.needs_input_grad[0]:
+            return None, None, None, None, None
+        if not grad_output.is_contiguous():
+            grad_output = grad_output.contiguous()
+
+        action_starts, action_ends, llm_offsets, action_offsets = ctx.saved_tensors
+        grad_input = torch.empty(
+            (ctx.batch_size, ctx.seq_length, grad_output.size(1)),
+            dtype=grad_output.dtype,
+            device=grad_output.device,
+        )
+        _m().two_expert_unpack(
+            grad_input,
+            grad_output,
+            ctx.batch_size,
+            ctx.seq_length,
+            action_starts,
+            action_ends,
+            llm_offsets,
+            action_offsets,
+        )
+        return grad_input, None, None, None, None
+
+
+class _TwoExpertUnpack(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        input_act: torch.Tensor,
+        batch_size: int,
+        seq_length: int,
+        action_starts: torch.Tensor,
+        action_ends: torch.Tensor,
+        llm_offsets: torch.Tensor,
+        action_offsets: torch.Tensor,
+    ):
+        if input_act.is_cpu:
+            raise RuntimeError("two_expert_unpack expects a CUDA tensor")
+        if input_act.dim() != 2:
+            raise RuntimeError("two_expert_unpack expects input shape [B*S, D]")
+
+        batch_size = int(batch_size)
+        seq_length = int(seq_length)
+        if input_act.size(0) != batch_size * seq_length:
+            raise RuntimeError(
+                f"packed rows mismatch: got {input_act.size(0)}, "
+                f"expected {batch_size * seq_length}"
+            )
+        _check_layout_tensors(
+            action_starts,
+            action_ends,
+            llm_offsets,
+            action_offsets,
+            batch_size=batch_size,
+            device=input_act.device,
+        )
+
+        if not input_act.is_contiguous():
+            input_act = input_act.contiguous()
+
+        output = torch.empty(
+            (batch_size, seq_length, input_act.size(1)),
+            dtype=input_act.dtype,
+            device=input_act.device,
+        )
+        _m().two_expert_unpack(
+            output,
+            input_act,
+            batch_size,
+            seq_length,
+            action_starts,
+            action_ends,
+            llm_offsets,
+            action_offsets,
+        )
+
+        ctx.save_for_backward(action_starts, action_ends, llm_offsets, action_offsets)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        if not ctx.needs_input_grad[0]:
+            return None, None, None, None, None, None, None
+        if not grad_output.is_contiguous():
+            grad_output = grad_output.contiguous()
+
+        batch_size, seq_length, hidden_dim = grad_output.shape
+        action_starts, action_ends, llm_offsets, action_offsets = ctx.saved_tensors
+        grad_input = torch.empty(
+            (batch_size * seq_length, hidden_dim),
+            dtype=grad_output.dtype,
+            device=grad_output.device,
+        )
+        _m().two_expert_pack(
+            grad_input,
+            grad_output,
+            action_starts,
+            action_ends,
+            llm_offsets,
+            action_offsets,
+        )
+        return grad_input, None, None, None, None, None, None
+
+
+def two_expert_pack_kernel(
+    input_act: torch.Tensor,
+    action_starts: torch.Tensor,
+    action_ends: torch.Tensor,
+    llm_offsets: torch.Tensor,
+    action_offsets: torch.Tensor,
+) -> torch.Tensor:
+    return _TwoExpertPack.apply(
+        input_act, action_starts, action_ends, llm_offsets, action_offsets
+    )
+
+
+def two_expert_unpack_kernel(
+    input_act: torch.Tensor,
+    batch_size: int,
+    seq_length: int,
+    action_starts: torch.Tensor,
+    action_ends: torch.Tensor,
+    llm_offsets: torch.Tensor,
+    action_offsets: torch.Tensor,
+) -> torch.Tensor:
+    return _TwoExpertUnpack.apply(
+        input_act,
+        batch_size,
+        seq_length,
+        action_starts,
+        action_ends,
+        llm_offsets,
+        action_offsets,
+    )
+
+
+
+
+def _get_sm_count():
+    """Cache SM count for the current GPU."""
+    if not hasattr(_get_sm_count, "_count"):
+        _get_sm_count._count = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+    return _get_sm_count._count
+
+
+def _get_rmsnorm_backward_blocks(num_tokens: int) -> int:
+    return min(_get_sm_count() * 2, num_tokens)
+
+
+def _is_rmsnorm_kernel_layout(tensor: torch.Tensor) -> bool:
+    if tensor.dim() < 1 or tensor.stride(-1) != 1:
+        return False
+    if tensor.dim() == 1:
+        return True
+
+    hidden_size = tensor.size(-1)
+    row_stride = tensor.stride(-2)
+    if row_stride < hidden_size:
+        return False
+
+    expected_stride = row_stride
+    for dim in range(tensor.dim() - 2, -1, -1):
+        if tensor.stride(dim) != expected_stride:
+            return False
+        expected_stride *= tensor.size(dim)
+    return True
+
+
+def _force_kernel_layout(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a tensor the RMSNorm kernel accepts (fully-packed row layout).
+
+    ``.contiguous()`` is NOT sufficient: a leading size-1 dim (e.g. a
+    ``[1, S/sp, H]`` sequence-parallel shard of a ``[1, S, H]`` tensor) keeps a
+    stale outer stride yet torch still reports ``is_contiguous()==True``, so
+    ``.contiguous()`` is a no-op while the kernel's strict
+    ``stride(i) == expected_stride`` check still fails. Flatten the leading dims
+    and re-expand to force genuine packed strides."""
+    if _is_rmsnorm_kernel_layout(tensor):
+        return tensor
+    flat = tensor.reshape(-1, tensor.shape[-1]).contiguous()
+    return flat.reshape(tensor.shape)
+
+
+class _RmsnormFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, weight, epsilon, zero_centered):
+        input = _force_kernel_layout(input)
+        output = torch.empty_like(input)
+        if zero_centered:
+            _m().rmsnorm_zero_centered(output, input, weight, epsilon)
+        else:
+            _m().rmsnorm(output, input, weight, epsilon)
+        ctx.save_for_backward(input, weight)
+        ctx.epsilon = epsilon
+        ctx.zero_centered = zero_centered
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input, weight = ctx.saved_tensors
+        epsilon = ctx.epsilon
+        zero_centered = ctx.zero_centered
+        grad_output = _force_kernel_layout(grad_output)
+        hidden_size = weight.numel()
+        num_tokens = input.numel() // hidden_size
+
+        dx = torch.empty_like(input)
+        dw_float = torch.empty(hidden_size, dtype=torch.float32, device=input.device)
+
+        # Pre-allocate partial_dw buffer: [num_blocks, hidden_size]
+        num_blocks = _get_rmsnorm_backward_blocks(num_tokens)
+        partial_dw = torch.empty(
+            num_blocks, hidden_size, dtype=torch.float32, device=input.device
+        )
+
+        if zero_centered:
+            _m().rmsnorm_zero_centered_backward(
+                dx, dw_float, partial_dw, grad_output, input, weight, epsilon
+            )
+        else:
+            _m().rmsnorm_backward(
+                dx, dw_float, partial_dw, grad_output, input, weight, epsilon
+            )
+
+        dw = dw_float.to(weight.dtype)
+        return dx, dw, None, None
+
+
+def _prepare_add_rmsnorm_inputs(residual, input):
+    """Shared prologue for the autograd and inference add_rmsnorm paths:
+    validate shapes, force kernel layout, allocate the two outputs."""
+    if residual.shape != input.shape:
+        raise ValueError(
+            f"add_rmsnorm residual shape {tuple(residual.shape)} "
+            f"does not match input shape {tuple(input.shape)}"
+        )
+    residual = _force_kernel_layout(residual)
+    input = _force_kernel_layout(input)
+    return residual, input, torch.empty_like(input), torch.empty_like(input)
+
+
+class _AddRmsnormFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, residual, input, weight, epsilon, zero_centered):
+        residual, input, sum_output, norm_output = _prepare_add_rmsnorm_inputs(
+            residual, input
+        )
+        hidden_size = weight.numel()
+        num_tokens = input.numel() // hidden_size
+        rstd = torch.empty(num_tokens, dtype=torch.float32, device=input.device)
+        if zero_centered:
+            _m().add_rmsnorm_zero_centered_with_rstd(
+                sum_output, norm_output, rstd, residual, input, weight, epsilon
+            )
+        else:
+            _m().add_rmsnorm_with_rstd(
+                sum_output, norm_output, rstd, residual, input, weight, epsilon
+            )
+        ctx.save_for_backward(sum_output, weight, rstd)
+        ctx.epsilon = epsilon
+        ctx.zero_centered = zero_centered
+        return sum_output, norm_output
+
+    @staticmethod
+    def backward(ctx, grad_sum_output, grad_norm_output):
+        sum_output, weight, rstd = ctx.saved_tensors
+        epsilon = ctx.epsilon
+        zero_centered = ctx.zero_centered
+        hidden_size = weight.numel()
+
+        if grad_norm_output is None:
+            d_rms = None
+            dw = None
+        else:
+            grad_norm_output = _force_kernel_layout(grad_norm_output)
+
+            num_tokens = sum_output.numel() // hidden_size
+            dw_float = torch.empty(
+                hidden_size, dtype=torch.float32, device=sum_output.device
+            )
+
+            use_rstd_backward = grad_sum_output is not None and hidden_size <= 4096
+            num_blocks = _get_rmsnorm_backward_blocks(num_tokens)
+            partial_dw = torch.empty(
+                num_blocks, hidden_size, dtype=torch.float32, device=sum_output.device
+            )
+
+            if use_rstd_backward:
+                grad_sum_output = _force_kernel_layout(grad_sum_output)
+                d_add = torch.empty_like(sum_output)
+                if zero_centered:
+                    _m().add_rmsnorm_zero_centered_backward_with_rstd(
+                        d_add,
+                        dw_float,
+                        partial_dw,
+                        grad_sum_output,
+                        grad_norm_output,
+                        sum_output,
+                        weight,
+                        rstd,
+                    )
+                else:
+                    _m().add_rmsnorm_backward_with_rstd(
+                        d_add,
+                        dw_float,
+                        partial_dw,
+                        grad_sum_output,
+                        grad_norm_output,
+                        sum_output,
+                        weight,
+                        rstd,
+                    )
+                return d_add, d_add, dw_float.to(weight.dtype), None, None
+
+            d_rms = torch.empty_like(sum_output)
+            if zero_centered:
+                _m().rmsnorm_zero_centered_backward(
+                    d_rms,
+                    dw_float,
+                    partial_dw,
+                    grad_norm_output,
+                    sum_output,
+                    weight,
+                    epsilon,
+                )
+            else:
+                _m().rmsnorm_backward(
+                    d_rms,
+                    dw_float,
+                    partial_dw,
+                    grad_norm_output,
+                    sum_output,
+                    weight,
+                    epsilon,
+                )
+            dw = dw_float.to(weight.dtype)
+
+        if grad_sum_output is None:
+            d_add = d_rms
+        elif d_rms is None:
+            d_add = grad_sum_output
+        else:
+            d_add = grad_sum_output + d_rms
+
+        return d_add, d_add, dw, None, None
+
+
+class Rmsnorm:
+    def __init__(self):
+        pass
+
+    def __call__(self, input, weight, epsilon, inference=False, zero_centered=False):
+        if inference:
+            input = _force_kernel_layout(input)
+            output = torch.empty_like(input)
+            if zero_centered:
+                _m().rmsnorm_zero_centered(output, input, weight, epsilon)
+            else:
+                _m().rmsnorm(output, input, weight, epsilon)
+            return output
+        return _RmsnormFunction.apply(input, weight, epsilon, zero_centered)
+
+
+class AddRmsnorm:
+    def __init__(self):
+        pass
+
+    def __call__(
+        self, residual, input, weight, epsilon, inference=False, zero_centered=False
+    ):
+        if inference:
+            residual, input, sum_output, norm_output = _prepare_add_rmsnorm_inputs(
+                residual, input
+            )
+            if zero_centered:
+                _m().add_rmsnorm_zero_centered(
+                    sum_output, norm_output, residual, input, weight, epsilon
+                )
+            else:
+                _m().add_rmsnorm(
+                    sum_output, norm_output, residual, input, weight, epsilon
+                )
+            return sum_output, norm_output
+
+        return _AddRmsnormFunction.apply(
+            residual, input, weight, epsilon, zero_centered
+        )
+
+
+
+
+class _SiluAndMulSplitFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input1: torch.Tensor) -> torch.Tensor:
+        intermediate_size = input1.size(-1) // 2
+        output = torch.empty(
+            (*input1.shape[:-1], intermediate_size),
+            dtype=input1.dtype,
+            device=input1.device,
+        )
+        _m().silu_and_mul_split(output, input1)
+        ctx.save_for_backward(input1)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        if not ctx.needs_input_grad[0]:
+            return None
+
+        (gate_up,) = ctx.saved_tensors
+        if grad_output.stride(-1) != 1:
+            grad_output = grad_output.contiguous()
+
+        grad_gate_up = torch.empty_like(gate_up)
+        _m().silu_and_mul_split_inplace_backward(
+            grad_gate_up, grad_output, gate_up
+        )
+        return grad_gate_up
+
+
+class _SiluAndMulSplitInplaceFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input1: torch.Tensor) -> torch.Tensor:
+        _m().silu_and_mul_split_inplace(input1)
+        intermediate_size = input1.size(-1) // 2
+        return input1[..., :intermediate_size]
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        raise RuntimeError(
+            "silu_and_mul split inplace mutates its input and is only used "
+            "for inference/no-grad execution"
+        )
+
+
+def silu_and_mul_split_inplace(input1: torch.Tensor) -> torch.Tensor:
+    if torch.is_grad_enabled() and input1.requires_grad:
+        return _SiluAndMulSplitFunction.apply(input1)
+    return _SiluAndMulSplitInplaceFunction.apply(input1)
+
+
+class _SiluAndMulFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
+        if not input1.is_contiguous():
+            input1 = input1.contiguous()
+        if not input2.is_contiguous():
+            input2 = input2.contiguous()
+        output = torch.empty_like(input1)
+        _m().silu_and_mul(output, input1, input2)
+        ctx.save_for_backward(input1, input2)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        needs_input1, needs_input2 = ctx.needs_input_grad
+        if not needs_input1 and not needs_input2:
+            return None, None
+
+        input1, input2 = ctx.saved_tensors
+        if grad_output.stride(-1) != 1 or not grad_output.is_contiguous():
+            grad_output = grad_output.contiguous()
+
+        grad_input1 = torch.empty_like(input1)
+        grad_input2 = torch.empty_like(input2)
+        _m().silu_and_mul_backward(
+            grad_input1, grad_input2, grad_output, input1, input2
+        )
+        if not needs_input1:
+            grad_input1 = None
+        if not needs_input2:
+            grad_input2 = None
+        return grad_input1, grad_input2
+
+
+def silu_and_mul_two_input(input1: torch.Tensor, input2: torch.Tensor) -> torch.Tensor:
+    return _SiluAndMulFunction.apply(input1, input2)
+
+
+class SiluAndMul:
+    def __init__(self):
+        pass
+
+    def __call__(
+        self, input1: torch.Tensor, input2: torch.Tensor = None, inplace: bool = False
+    ) -> torch.Tensor:
+        """Fused SiLU + elementwise multiply, with optional fused split.
+
+        Two calling conventions:
+
+        1. Split mode (input2 is None, inplace must be True):
+               out = op(gate_up, inplace=True)
+           gate_up has shape [..., 2*N].  The kernel reads gate = gate_up[..., :N]
+           and up = gate_up[..., N:], computes silu(gate)*up, and writes the result
+           back into gate_up[..., :N] in-place.  Returns gate_up[..., :N].
+
+        2. Two-tensor mode (input2 is provided):
+               out = op(gate, up)            # non-inplace, allocates output
+               out = op(gate, up, inplace=True)   # inplace, returns gate
+           gate and up must have the same shape.
+
+        Args:
+            input1: gate tensor (two-tensor mode) or combined gate_up tensor (split mode).
+            input2: up tensor; omit to use split mode.
+            inplace: if True, writes result back into input1 (saves one allocation).
+
+        Returns:
+            Tensor: silu(gate) * up, shape [..., N].
+        """
+        if input2 is None:
+            assert inplace, "split mode requires inplace=True"
+            assert input1.size(-1) % 2 == 0, "last dim must be even for split mode"
+            return silu_and_mul_split_inplace(input1)
+        if inplace:
+            _m().silu_and_mul_inplace(input1, input2)
+            return input1
+        return silu_and_mul_two_input(input1, input2)

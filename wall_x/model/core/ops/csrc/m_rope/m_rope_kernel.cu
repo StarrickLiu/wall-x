@@ -12,9 +12,29 @@
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cfloat>
+#include <cstdint>
 #include "../common/cuda_utils.h"
 
 namespace wallx_cuda_m_rope {
+
+constexpr int64_t kMaxMRopeGridDimYZ = 65535;
+
+inline dim3 MakeMRopeGrid(int64_t batch, int64_t seq_len) {
+    ASSERT_CHECK(batch > 0);
+    ASSERT_CHECK(seq_len > 0);
+    ASSERT_CHECK(batch <= 2147483647LL);
+
+    const int64_t grid_z = (seq_len + kMaxMRopeGridDimYZ - 1) / kMaxMRopeGridDimYZ;
+    ASSERT_CHECK(grid_z <= kMaxMRopeGridDimYZ);
+    const int64_t grid_y = (seq_len + grid_z - 1) / grid_z;
+    return dim3(static_cast<unsigned int>(batch),
+                static_cast<unsigned int>(grid_y),
+                static_cast<unsigned int>(grid_z));
+}
+
+__device__ __forceinline__ int64_t MRopeSeqBlockIdx() {
+    return static_cast<int64_t>(blockIdx.y) + static_cast<int64_t>(blockIdx.z) * gridDim.y;
+}
 
 // Helper: convert vector of T to float4
 template<typename T>
@@ -66,6 +86,21 @@ __device__ __forceinline__ void from_float4(T* ptr, const float4& f4) {
     }
 }
 
+template<typename T>
+__device__ __forceinline__ void copy4(T* dst, const T* src) {
+    if constexpr (std::is_same_v<T, half>) {
+        reinterpret_cast<half2*>(dst)[0] = reinterpret_cast<const half2*>(src)[0];
+        reinterpret_cast<half2*>(dst)[1] = reinterpret_cast<const half2*>(src)[1];
+    } else if constexpr (std::is_same_v<T, __nv_bfloat16>) {
+        reinterpret_cast<__nv_bfloat162*>(dst)[0] = reinterpret_cast<const __nv_bfloat162*>(src)[0];
+        reinterpret_cast<__nv_bfloat162*>(dst)[1] = reinterpret_cast<const __nv_bfloat162*>(src)[1];
+    } else if constexpr (std::is_same_v<T, float>) {
+        reinterpret_cast<float4*>(dst)[0] = reinterpret_cast<const float4*>(src)[0];
+    } else {
+        static_assert(sizeof(T) == 0, "Unsupported type");
+    }
+}
+
 template<class T>
 __global__ void MRopeKernel(const float* cos,
                             const float* sin,
@@ -78,27 +113,31 @@ __global__ void MRopeKernel(const float* cos,
                             const int first,
                             const int second,
                             const int d,
-                            const int qb_stride,
-                            const int qs_stride,
-                            const int qh_stride,
-                            const int kb_stride,
-                            const int ks_stride,
-                            const int kh_stride,
-                            const int qeb_stride,
-                            const int qes_stride,
-                            const int qeh_stride,
-                            const int keb_stride,
-                            const int kes_stride,
-                            const int keh_stride) {
+                            const int64_t seq_len,
+                            // int64 strides: (batch)*(b_stride) overflows int32 for
+                            // tensors past 2^31 elements (e.g. b>=128 at s=4096,h=32,d=128).
+                            const int64_t qb_stride,
+                            const int64_t qs_stride,
+                            const int64_t qh_stride,
+                            const int64_t kb_stride,
+                            const int64_t ks_stride,
+                            const int64_t kh_stride,
+                            const int64_t qeb_stride,
+                            const int64_t qes_stride,
+                            const int64_t qeh_stride,
+                            const int64_t keb_stride,
+                            const int64_t kes_stride,
+                            const int64_t keh_stride) {
     extern __shared__ char cos_sin[];
     const int half_dim = d / 2;
     float* cos_smem = reinterpret_cast<float*>(cos_sin);
     float* sin_smem = cos_smem + half_dim;
     int b = blockIdx.x;
-    int s = blockIdx.y;
+    int64_t s = MRopeSeqBlockIdx();
+    if (s >= seq_len) return;
 
-    int64_t offset = gridDim.x * gridDim.y * half_dim;
-    int64_t cos_sin_b_stride = gridDim.y * half_dim;
+    int64_t offset = static_cast<int64_t>(gridDim.x) * seq_len * half_dim;
+    int64_t cos_sin_b_stride = seq_len * half_dim;
     int64_t cos_sin_s_stride = half_dim;
 #define SIN_GMEM(a, b, c, d) sin[(a) * offset + (b) * cos_sin_b_stride + (c) * cos_sin_s_stride + (d)]
 #define COS_GMEM(a, b, c, d) cos[(a) * offset + (b) * cos_sin_b_stride + (c) * cos_sin_s_stride + (d)]
@@ -185,17 +224,19 @@ template<class T>
 __global__ void MRopeInplaceKernel(float* cos, float* sin,
                                    T* q, const int q_h, T* k, const int k_h,
                                    const int first, const int second,
-                                   const int d, const int qb_stride, const int qs_stride, const int qh_stride,
-                                   const int kb_stride, const int ks_stride, const int kh_stride) {
+                                   const int d, const int64_t seq_len,
+                                   const int64_t qb_stride, const int64_t qs_stride, const int64_t qh_stride,
+                                   const int64_t kb_stride, const int64_t ks_stride, const int64_t kh_stride) {
     extern __shared__ char cos_sin[];
     const int half_dim = d / 2;
     float* cos_smem = reinterpret_cast<float*>(cos_sin);
     float* sin_smem = cos_smem + half_dim;
     int b = blockIdx.x;
-    int s = blockIdx.y;
+    int64_t s = MRopeSeqBlockIdx();
+    if (s >= seq_len) return;
 
-    int64_t offset = gridDim.x * gridDim.y * half_dim;
-    int64_t cos_sin_b_stride = gridDim.y * half_dim;
+    int64_t offset = static_cast<int64_t>(gridDim.x) * seq_len * half_dim;
+    int64_t cos_sin_b_stride = seq_len * half_dim;
     int64_t cos_sin_s_stride = half_dim;
 #define SIN_GMEM(a, b, c, d) sin[(a) * offset + (b) * cos_sin_b_stride + (c) * cos_sin_s_stride + (d)]
 #define COS_GMEM(a, b, c, d) cos[(a) * offset + (b) * cos_sin_b_stride + (c) * cos_sin_s_stride + (d)]
@@ -277,6 +318,153 @@ __global__ void MRopeInplaceKernel(float* cos, float* sin,
 }
 
 template<class T>
+__global__ void MRopeInplaceCfgCacheWriteKernel(
+    const float* cos,
+    const float* sin,
+    T* q,
+    const int q_h,
+    T* k,
+    const int k_h,
+    const T* v,
+    T* kvcache,
+    const int64_t* valid0,
+    const int64_t* valid1,
+    const int common_len,
+    const int cond_tail_len,
+    const int first,
+    const int second,
+    const int d,
+    const int64_t qb_stride,
+    const int64_t qs_stride,
+    const int64_t qh_stride,
+    const int64_t kb_stride,
+    const int64_t ks_stride,
+    const int64_t kh_stride,
+    const int64_t vb_stride,
+    const int64_t vs_stride,
+    const int64_t vh_stride,
+    const int64_t cache_kv_stride,
+    const int64_t cache_batch_stride,
+    const int64_t cache_seq_stride,
+    const int64_t cache_head_stride) {
+    extern __shared__ char cos_sin[];
+    const int half_dim = d / 2;
+    float* cos_smem = reinterpret_cast<float*>(cos_sin);
+    float* sin_smem = cos_smem + half_dim;
+    const int b = blockIdx.x;
+    const int s = blockIdx.y;
+
+    const int64_t offset = static_cast<int64_t>(gridDim.x) * gridDim.y * half_dim;
+    const int64_t cos_sin_b_stride = static_cast<int64_t>(gridDim.y) * half_dim;
+    const int64_t cos_sin_s_stride = half_dim;
+
+    for (int i = threadIdx.x; i < half_dim; i += blockDim.x) {
+        const int rope_axis = (i < first) ? 0 : ((i < first + second) ? 1 : 2);
+        const int64_t rope_offset = static_cast<int64_t>(rope_axis) * offset +
+                                    static_cast<int64_t>(b) * cos_sin_b_stride +
+                                    static_cast<int64_t>(s) * cos_sin_s_stride + i;
+        cos_smem[i] = cos[rope_offset];
+        sin_smem[i] = sin[rope_offset];
+    }
+    __syncthreads();
+
+    const int cond_end = common_len + cond_tail_len;
+    const bool is_common = s < common_len;
+    const bool is_cond_tail = (s >= common_len) && (s < cond_end);
+    int64_t cache_pos0 = -1;
+    int64_t cache_pos1 = -1;
+    if (is_common) {
+        cache_pos0 = valid0[s];
+        cache_pos1 = valid1[s];
+    } else if (is_cond_tail) {
+        cache_pos0 = valid0[s];
+    } else {
+        const int valid1_idx = common_len + (s - cond_end);
+        cache_pos1 = valid1[valid1_idx];
+    }
+
+    for (int j = threadIdx.x * 4; j < q_h * half_dim; j += blockDim.x * 4) {
+        const int h_idx = j / half_dim;
+        const int base_d = j % half_dim;
+        if (base_d + 3 >= half_dim) continue;
+
+        T* q0_ptr = q + static_cast<int64_t>(b) * qb_stride + static_cast<int64_t>(s) * qs_stride +
+                    static_cast<int64_t>(h_idx) * qh_stride + base_d;
+        T* q1_ptr = q0_ptr + half_dim;
+        const float4 q_x0 = to_float4<T>(q0_ptr);
+        const float4 q_x1 = to_float4<T>(q1_ptr);
+        const float4 cos_vec = to_float4<float>(cos_smem + base_d);
+        const float4 sin_vec = to_float4<float>(sin_smem + base_d);
+
+        const float4 q0_rot = make_float4(
+            q_x0.x * cos_vec.x - q_x1.x * sin_vec.x,
+            q_x0.y * cos_vec.y - q_x1.y * sin_vec.y,
+            q_x0.z * cos_vec.z - q_x1.z * sin_vec.z,
+            q_x0.w * cos_vec.w - q_x1.w * sin_vec.w);
+        const float4 q1_rot = make_float4(
+            q_x1.x * cos_vec.x + q_x0.x * sin_vec.x,
+            q_x1.y * cos_vec.y + q_x0.y * sin_vec.y,
+            q_x1.z * cos_vec.z + q_x0.z * sin_vec.z,
+            q_x1.w * cos_vec.w + q_x0.w * sin_vec.w);
+
+        from_float4<T>(q0_ptr, q0_rot);
+        from_float4<T>(q1_ptr, q1_rot);
+    }
+
+    T* key_cache = kvcache;
+    T* value_cache = kvcache + cache_kv_stride;
+    for (int j = threadIdx.x * 4; j < k_h * half_dim; j += blockDim.x * 4) {
+        const int h_idx = j / half_dim;
+        const int base_d = j % half_dim;
+        if (base_d + 3 >= half_dim) continue;
+
+        T* k0_ptr = k + static_cast<int64_t>(b) * kb_stride + static_cast<int64_t>(s) * ks_stride +
+                    static_cast<int64_t>(h_idx) * kh_stride + base_d;
+        T* k1_ptr = k0_ptr + half_dim;
+        const T* v0_ptr = v + static_cast<int64_t>(b) * vb_stride + static_cast<int64_t>(s) * vs_stride +
+                          static_cast<int64_t>(h_idx) * vh_stride + base_d;
+        const T* v1_ptr = v0_ptr + half_dim;
+
+        const float4 k_x0 = to_float4<T>(k0_ptr);
+        const float4 k_x1 = to_float4<T>(k1_ptr);
+        const float4 cos_vec = to_float4<float>(cos_smem + base_d);
+        const float4 sin_vec = to_float4<float>(sin_smem + base_d);
+
+        const float4 k0_rot = make_float4(
+            k_x0.x * cos_vec.x - k_x1.x * sin_vec.x,
+            k_x0.y * cos_vec.y - k_x1.y * sin_vec.y,
+            k_x0.z * cos_vec.z - k_x1.z * sin_vec.z,
+            k_x0.w * cos_vec.w - k_x1.w * sin_vec.w);
+        const float4 k1_rot = make_float4(
+            k_x1.x * cos_vec.x + k_x0.x * sin_vec.x,
+            k_x1.y * cos_vec.y + k_x0.y * sin_vec.y,
+            k_x1.z * cos_vec.z + k_x0.z * sin_vec.z,
+            k_x1.w * cos_vec.w + k_x0.w * sin_vec.w);
+
+        from_float4<T>(k0_ptr, k0_rot);
+        from_float4<T>(k1_ptr, k1_rot);
+
+        const int64_t cache_head_offset = static_cast<int64_t>(h_idx) * cache_head_stride + base_d;
+        if (is_common || is_cond_tail) {
+            T* kc0 = key_cache + 0 * cache_batch_stride + cache_pos0 * cache_seq_stride + cache_head_offset;
+            T* vc0 = value_cache + 0 * cache_batch_stride + cache_pos0 * cache_seq_stride + cache_head_offset;
+            from_float4<T>(kc0, k0_rot);
+            from_float4<T>(kc0 + half_dim, k1_rot);
+            copy4<T>(vc0, v0_ptr);
+            copy4<T>(vc0 + half_dim, v1_ptr);
+        }
+        if (is_common || !is_cond_tail) {
+            T* kc1 = key_cache + 1 * cache_batch_stride + cache_pos1 * cache_seq_stride + cache_head_offset;
+            T* vc1 = value_cache + 1 * cache_batch_stride + cache_pos1 * cache_seq_stride + cache_head_offset;
+            from_float4<T>(kc1, k0_rot);
+            from_float4<T>(kc1 + half_dim, k1_rot);
+            copy4<T>(vc1, v0_ptr);
+            copy4<T>(vc1 + half_dim, v1_ptr);
+        }
+    }
+}
+
+template<class T>
 __global__ void MRopeKernelBackward(
     const float* cos,
     const float* sin,
@@ -288,8 +476,9 @@ __global__ void MRopeKernelBackward(
     const int q_h,
     const int k_h,
     const int d,
-    const int qb_stride, const int qs_stride, const int qh_stride,
-    const int kb_stride, const int ks_stride, const int kh_stride) {
+    const int64_t seq_len,
+    const int64_t qb_stride, const int64_t qs_stride, const int64_t qh_stride,
+    const int64_t kb_stride, const int64_t ks_stride, const int64_t kh_stride) {
 
     extern __shared__ char cos_sin[];
     const int half_dim = d / 2;
@@ -297,10 +486,11 @@ __global__ void MRopeKernelBackward(
     float* sin_smem = cos_smem + half_dim;
 
     int b = blockIdx.x;
-    int s = blockIdx.y;
+    int64_t s = MRopeSeqBlockIdx();
+    if (s >= seq_len) return;
 
-    int64_t offset = gridDim.x * gridDim.y * half_dim;
-    int64_t cos_sin_b_stride = gridDim.y * half_dim;
+    int64_t offset = static_cast<int64_t>(gridDim.x) * seq_len * half_dim;
+    int64_t cos_sin_b_stride = seq_len * half_dim;
     int64_t cos_sin_s_stride = half_dim;
 
 #define SIN_GMEM(a, b, c, d) sin[(a) * offset + (b) * cos_sin_b_stride + (c) * cos_sin_s_stride + (d)]
@@ -444,7 +634,7 @@ void MRope(const at::Tensor& q, // [b, s, h, d]
     int64_t qeh_stride = q_embed.stride(2);
     int64_t keh_stride = k_embed.stride(2);
 
-    dim3 grid(batch, seq_len);
+    dim3 grid = MakeMRopeGrid(batch, seq_len);
 
     if (q.scalar_type() == at::kHalf) {
         const half* q_data = static_cast<const half*>(q.data_ptr());
@@ -458,7 +648,7 @@ void MRope(const at::Tensor& q, // [b, s, h, d]
             q_data, q_head_num,
             k_data, k_head_num,
             q_embed_data, k_embed_data,
-            first, second, dim,
+            first, second, dim, seq_len,
             qb_stride, qs_stride, qh_stride, kb_stride, ks_stride, kh_stride,
             qeb_stride, qes_stride, qeh_stride, keb_stride, kes_stride, keh_stride);
     } else if (q.scalar_type() == at::kBFloat16) {
@@ -473,7 +663,7 @@ void MRope(const at::Tensor& q, // [b, s, h, d]
             q_data, q_head_num,
             k_data, k_head_num,
             q_embed_data, k_embed_data,
-            first, second, dim,
+            first, second, dim, seq_len,
             qb_stride, qs_stride, qh_stride, kb_stride, ks_stride, kh_stride,
             qeb_stride, qes_stride, qeh_stride, keb_stride, kes_stride, keh_stride);
     } else if (q.scalar_type() == at::kFloat) {
@@ -488,7 +678,7 @@ void MRope(const at::Tensor& q, // [b, s, h, d]
             q_data, q_head_num,
             k_data, k_head_num,
             q_embed_data, k_embed_data,
-            first, second, dim,
+            first, second, dim, seq_len,
             qb_stride, qs_stride, qh_stride, kb_stride, ks_stride, kh_stride,
             qeb_stride, qes_stride, qeh_stride, keb_stride, kes_stride, keh_stride
         );
@@ -537,7 +727,7 @@ void MRopeInplace(const at::Tensor& q, // [b, s, h, d]
     int64_t qh_stride = q.stride(2);
     int64_t kh_stride = k.stride(2);
 
-    dim3 grid(batch, seq_len);
+    dim3 grid = MakeMRopeGrid(batch, seq_len);
 
     if (q.scalar_type() == at::kHalf) {
         half* q_data = static_cast<half*>(q.data_ptr());
@@ -548,7 +738,7 @@ void MRopeInplace(const at::Tensor& q, // [b, s, h, d]
             cos_data, sin_data,
             q_data, q_head_num,
             k_data, k_head_num,
-            first, second, dim, qb_stride, qs_stride, qh_stride, kb_stride, ks_stride, kh_stride);
+            first, second, dim, seq_len, qb_stride, qs_stride, qh_stride, kb_stride, ks_stride, kh_stride);
     } else if (q.scalar_type() == at::kBFloat16) {
         __nv_bfloat16* q_data = static_cast<__nv_bfloat16*>(q.data_ptr());
         __nv_bfloat16* k_data = static_cast<__nv_bfloat16*>(k.data_ptr());
@@ -558,7 +748,7 @@ void MRopeInplace(const at::Tensor& q, // [b, s, h, d]
             cos_data, sin_data,
             q_data, q_head_num,
             k_data, k_head_num,
-            first, second, dim, qb_stride, qs_stride, qh_stride, kb_stride, ks_stride, kh_stride);
+            first, second, dim, seq_len, qb_stride, qs_stride, qh_stride, kb_stride, ks_stride, kh_stride);
     } else if (q.scalar_type() == at::kFloat) {
         float* q_data = static_cast<float*>(q.data_ptr());
         float* k_data = static_cast<float*>(k.data_ptr());
@@ -568,10 +758,134 @@ void MRopeInplace(const at::Tensor& q, // [b, s, h, d]
             cos_data, sin_data,
             q_data, q_head_num,
             k_data, k_head_num,
-            first, second, dim, qb_stride, qs_stride, qh_stride, kb_stride, ks_stride, kh_stride
+            first, second, dim, seq_len, qb_stride, qs_stride, qh_stride, kb_stride, ks_stride, kh_stride
         );
     } else {
         throw std::runtime_error("Unsupported data type for m_rope");
+    }
+
+    sync_check_cuda_error();
+}
+
+void MRopeInplaceCfgCacheWrite(const at::Tensor& q,        // [1, packed_seq, q_h, d]
+                                const at::Tensor& k,        // [1, packed_seq, kv_h, d]
+                                const at::Tensor& v,        // [1, packed_seq, kv_h, d]
+                                const at::Tensor& cos,      // [3, 1, packed_seq, d / 2]
+                                const at::Tensor& sin,      // [3, 1, packed_seq, d / 2]
+                                const at::Tensor& kvcache,  // [2, max_batch, max_len, kv_h, d]
+                                const at::Tensor& valid0,   // int64 original prefix indices for cond row
+                                const at::Tensor& valid1,   // int64 original prefix indices for uncond row
+                                int64_t common_len,
+                                int64_t cond_tail_len,
+                                const int first,
+                                const int second) {
+    int Nthreads = 256;
+    cudaStream_t stream = static_cast<cudaStream_t>(
+        at::cuda::getCurrentCUDAStream().stream());
+
+    ASSERT_CHECK(q.dim() == 4);
+    ASSERT_CHECK(k.dim() == 4);
+    ASSERT_CHECK(v.dim() == 4);
+    ASSERT_CHECK(kvcache.dim() == 5);
+    ASSERT_CHECK(q.scalar_type() == k.scalar_type());
+    ASSERT_CHECK(q.scalar_type() == v.scalar_type());
+    ASSERT_CHECK(q.scalar_type() == kvcache.scalar_type());
+    ASSERT_CHECK(q.size(0) == 1);
+    ASSERT_CHECK(k.size(0) == q.size(0));
+    ASSERT_CHECK(v.size(0) == q.size(0));
+    ASSERT_CHECK(k.size(1) == q.size(1));
+    ASSERT_CHECK(v.size(1) == q.size(1));
+    ASSERT_CHECK(v.size(2) == k.size(2));
+    ASSERT_CHECK(k.size(3) == q.size(3));
+    ASSERT_CHECK(v.size(3) == q.size(3));
+    ASSERT_CHECK(q.size(3) % 8 == 0);
+    ASSERT_CHECK(q.stride(3) == 1);
+    ASSERT_CHECK(k.stride(3) == 1);
+    ASSERT_CHECK(v.stride(3) == 1);
+    ASSERT_CHECK(kvcache.stride(4) == 1);
+
+    ASSERT_CHECK(cos.size(0) == 3);
+    ASSERT_CHECK(sin.size(0) == 3);
+    ASSERT_CHECK(cos.size(1) == q.size(0));
+    ASSERT_CHECK(sin.size(1) == q.size(0));
+    ASSERT_CHECK(cos.size(2) == q.size(1));
+    ASSERT_CHECK(sin.size(2) == q.size(1));
+    ASSERT_CHECK(cos.size(3) == q.size(3) / 2);
+    ASSERT_CHECK(sin.size(3) == q.size(3) / 2);
+    ASSERT_CHECK(cos.scalar_type() == at::kFloat);
+    ASSERT_CHECK(sin.scalar_type() == at::kFloat);
+    ASSERT_CHECK(cos.is_contiguous());
+    ASSERT_CHECK(sin.is_contiguous());
+
+    ASSERT_CHECK(kvcache.size(0) == 2);
+    ASSERT_CHECK(kvcache.size(1) >= 2);
+    ASSERT_CHECK(kvcache.size(3) == k.size(2));
+    ASSERT_CHECK(kvcache.size(4) == k.size(3));
+    ASSERT_CHECK(valid0.dim() == 1);
+    ASSERT_CHECK(valid1.dim() == 1);
+    ASSERT_CHECK(valid0.scalar_type() == at::kLong);
+    ASSERT_CHECK(valid1.scalar_type() == at::kLong);
+
+    int64_t seq_len = q.size(1);
+    int64_t uncond_tail_len = seq_len - common_len - cond_tail_len;
+    ASSERT_CHECK(common_len >= 0);
+    ASSERT_CHECK(cond_tail_len >= 0);
+    ASSERT_CHECK(uncond_tail_len >= 0);
+    ASSERT_CHECK(valid0.size(0) >= common_len + cond_tail_len);
+    ASSERT_CHECK(valid1.size(0) >= common_len + uncond_tail_len);
+
+    int64_t q_head_num = q.size(2);
+    int64_t k_head_num = k.size(2);
+    int64_t dim = q.size(3);
+    dim3 grid(q.size(0), seq_len);
+
+    if (q.scalar_type() == at::kHalf) {
+        MRopeInplaceCfgCacheWriteKernel<half><<<grid, Nthreads, dim * sizeof(float), stream>>>(
+            static_cast<const float*>(cos.data_ptr()),
+            static_cast<const float*>(sin.data_ptr()),
+            static_cast<half*>(q.data_ptr()), q_head_num,
+            static_cast<half*>(k.data_ptr()), k_head_num,
+            static_cast<const half*>(v.data_ptr()),
+            static_cast<half*>(kvcache.data_ptr()),
+            static_cast<const int64_t*>(valid0.data_ptr()),
+            static_cast<const int64_t*>(valid1.data_ptr()),
+            common_len, cond_tail_len, first, second, dim,
+            q.stride(0), q.stride(1), q.stride(2),
+            k.stride(0), k.stride(1), k.stride(2),
+            v.stride(0), v.stride(1), v.stride(2),
+            kvcache.stride(0), kvcache.stride(1), kvcache.stride(2), kvcache.stride(3));
+    } else if (q.scalar_type() == at::kBFloat16) {
+        MRopeInplaceCfgCacheWriteKernel<__nv_bfloat16><<<grid, Nthreads, dim * sizeof(float), stream>>>(
+            static_cast<const float*>(cos.data_ptr()),
+            static_cast<const float*>(sin.data_ptr()),
+            static_cast<__nv_bfloat16*>(q.data_ptr()), q_head_num,
+            static_cast<__nv_bfloat16*>(k.data_ptr()), k_head_num,
+            static_cast<const __nv_bfloat16*>(v.data_ptr()),
+            static_cast<__nv_bfloat16*>(kvcache.data_ptr()),
+            static_cast<const int64_t*>(valid0.data_ptr()),
+            static_cast<const int64_t*>(valid1.data_ptr()),
+            common_len, cond_tail_len, first, second, dim,
+            q.stride(0), q.stride(1), q.stride(2),
+            k.stride(0), k.stride(1), k.stride(2),
+            v.stride(0), v.stride(1), v.stride(2),
+            kvcache.stride(0), kvcache.stride(1), kvcache.stride(2), kvcache.stride(3));
+    } else if (q.scalar_type() == at::kFloat) {
+        MRopeInplaceCfgCacheWriteKernel<float><<<grid, Nthreads, dim * sizeof(float), stream>>>(
+            static_cast<const float*>(cos.data_ptr()),
+            static_cast<const float*>(sin.data_ptr()),
+            static_cast<float*>(q.data_ptr()), q_head_num,
+            static_cast<float*>(k.data_ptr()), k_head_num,
+            static_cast<const float*>(v.data_ptr()),
+            static_cast<float*>(kvcache.data_ptr()),
+            static_cast<const int64_t*>(valid0.data_ptr()),
+            static_cast<const int64_t*>(valid1.data_ptr()),
+            common_len, cond_tail_len, first, second, dim,
+            q.stride(0), q.stride(1), q.stride(2),
+            k.stride(0), k.stride(1), k.stride(2),
+            v.stride(0), v.stride(1), v.stride(2),
+            kvcache.stride(0), kvcache.stride(1), kvcache.stride(2), kvcache.stride(3));
+    } else {
+        throw std::runtime_error("Unsupported data type for m_rope_inplace_cfg_cache_write");
     }
 
     sync_check_cuda_error();
@@ -620,7 +934,7 @@ void MRopeBackward(
     int64_t qh_stride = grad_q_embed.stride(2);
     int64_t kh_stride = grad_k_embed.stride(2);
 
-    dim3 grid(batch, seq_len);
+    dim3 grid = MakeMRopeGrid(batch, seq_len);
 
     if (grad_q_embed.scalar_type() == at::kHalf) {
         const half* gq_embed = static_cast<const half*>(grad_q_embed.data_ptr());
@@ -634,7 +948,7 @@ void MRopeBackward(
             gq_embed, gk_embed,
             gq, gk,
             first, second,
-            q_head_num, k_head_num, dim, qb_stride, qs_stride, qh_stride, kb_stride, ks_stride, kh_stride
+            q_head_num, k_head_num, dim, seq_len, qb_stride, qs_stride, qh_stride, kb_stride, ks_stride, kh_stride
         );
     } else if (grad_q_embed.scalar_type() == at::kBFloat16) {
         const __nv_bfloat16* gq_embed = static_cast<const __nv_bfloat16*>(grad_q_embed.data_ptr());
@@ -648,7 +962,7 @@ void MRopeBackward(
             gq_embed, gk_embed,
             gq, gk,
             first, second,
-            q_head_num, k_head_num, dim, qb_stride, qs_stride, qh_stride, kb_stride, ks_stride, kh_stride
+            q_head_num, k_head_num, dim, seq_len, qb_stride, qs_stride, qh_stride, kb_stride, ks_stride, kh_stride
         );
     } else if (grad_q_embed.scalar_type() == at::kFloat) {
         const float* gq_embed = static_cast<const float*>(grad_q_embed.data_ptr());
@@ -662,7 +976,7 @@ void MRopeBackward(
             gq_embed, gk_embed,
             gq, gk,
             first, second,
-            q_head_num, k_head_num, dim, qb_stride, qs_stride, qh_stride, kb_stride, ks_stride, kh_stride
+            q_head_num, k_head_num, dim, seq_len, qb_stride, qs_stride, qh_stride, kb_stride, ks_stride, kh_stride
         );
     } else {
         throw std::runtime_error("Unsupported data type for m_rope backward");
@@ -707,7 +1021,7 @@ void MRopeInplacePack(const at::Tensor& qkv, // [bz, seq_len, q_dim + 2*kv_dim]
     int64_t qkv_b_stride = qkv.stride(0);
     int64_t qkv_s_stride = qkv.stride(1);
 
-    dim3 grid(bz, seq_len);
+    dim3 grid = MakeMRopeGrid(bz, seq_len);
 
     if (qkv.scalar_type() == at::kHalf) {
         half* q_data    = static_cast<half*>(qkv.data_ptr());
@@ -717,7 +1031,7 @@ void MRopeInplacePack(const at::Tensor& qkv, // [bz, seq_len, q_dim + 2*kv_dim]
         MRopeInplaceKernel<half><<<grid, Nthreads, head_dim * sizeof(float), stream>>>(
             cos_data, sin_data,
             q_data, q_num_heads, k_data, kv_num_heads,
-            first, second, head_dim,
+            first, second, head_dim, seq_len,
             qkv_b_stride, qkv_s_stride, head_dim,
             qkv_b_stride, qkv_s_stride, head_dim);
     } else if (qkv.scalar_type() == at::kBFloat16) {
@@ -728,7 +1042,7 @@ void MRopeInplacePack(const at::Tensor& qkv, // [bz, seq_len, q_dim + 2*kv_dim]
         MRopeInplaceKernel<__nv_bfloat16><<<grid, Nthreads, head_dim * sizeof(float), stream>>>(
             cos_data, sin_data,
             q_data, q_num_heads, k_data, kv_num_heads,
-            first, second, head_dim,
+            first, second, head_dim, seq_len,
             qkv_b_stride, qkv_s_stride, head_dim,
             qkv_b_stride, qkv_s_stride, head_dim);
     } else if (qkv.scalar_type() == at::kFloat) {
@@ -739,7 +1053,7 @@ void MRopeInplacePack(const at::Tensor& qkv, // [bz, seq_len, q_dim + 2*kv_dim]
         MRopeInplaceKernel<float><<<grid, Nthreads, head_dim * sizeof(float), stream>>>(
             cos_data, sin_data,
             q_data, q_num_heads, k_data, kv_num_heads,
-            first, second, head_dim,
+            first, second, head_dim, seq_len,
             qkv_b_stride, qkv_s_stride, head_dim,
             qkv_b_stride, qkv_s_stride, head_dim);
     } else {
@@ -783,7 +1097,7 @@ void MRopeInplacePackBackward(const at::Tensor& dqkv, // [bz, seq_len, q_dim + 2
     int64_t dqkv_b_stride = dqkv.stride(0);
     int64_t dqkv_s_stride = dqkv.stride(1);
 
-    dim3 grid(bz, seq_len);
+    dim3 grid = MakeMRopeGrid(bz, seq_len);
 
     if (dqkv.scalar_type() == at::kHalf) {
         half* dq_data = static_cast<half*>(dqkv.data_ptr());
@@ -795,7 +1109,7 @@ void MRopeInplacePackBackward(const at::Tensor& dqkv, // [bz, seq_len, q_dim + 2
             dq_data, dk_data,
             dq_data, dk_data,
             first, second,
-            q_num_heads, kv_num_heads, head_dim,
+            q_num_heads, kv_num_heads, head_dim, seq_len,
             dqkv_b_stride, dqkv_s_stride, head_dim,
             dqkv_b_stride, dqkv_s_stride, head_dim);
     } else if (dqkv.scalar_type() == at::kBFloat16) {
@@ -808,7 +1122,7 @@ void MRopeInplacePackBackward(const at::Tensor& dqkv, // [bz, seq_len, q_dim + 2
             dq_data, dk_data,
             dq_data, dk_data,
             first, second,
-            q_num_heads, kv_num_heads, head_dim,
+            q_num_heads, kv_num_heads, head_dim, seq_len,
             dqkv_b_stride, dqkv_s_stride, head_dim,
             dqkv_b_stride, dqkv_s_stride, head_dim);
     } else if (dqkv.scalar_type() == at::kFloat) {
@@ -821,7 +1135,7 @@ void MRopeInplacePackBackward(const at::Tensor& dqkv, // [bz, seq_len, q_dim + 2
             dq_data, dk_data,
             dq_data, dk_data,
             first, second,
-            q_num_heads, kv_num_heads, head_dim,
+            q_num_heads, kv_num_heads, head_dim, seq_len,
             dqkv_b_stride, dqkv_s_stride, head_dim,
             dqkv_b_stride, dqkv_s_stride, head_dim);
     } else {
@@ -831,6 +1145,7 @@ void MRopeInplacePackBackward(const at::Tensor& dqkv, // [bz, seq_len, q_dim + 2
     sync_check_cuda_error();
 }
 
+// Removed TVM FFI export (see pybind11 registration)
 // Removed TVM FFI export (see pybind11 registration)
 // Removed TVM FFI export (see pybind11 registration)
 // Removed TVM FFI export (see pybind11 registration)

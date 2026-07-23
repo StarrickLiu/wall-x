@@ -195,6 +195,49 @@ def build_action_expert_param_groups(model, opt_cfg, action_lr_keywords):
     )
 
 
+def _split_dtensor_regular_groups(params_or_groups):
+    """Split params into DTensor and regular-Tensor groups for fused AdamW.
+
+    PyTorch's _fused_adamw_ kernel raises if a single param_group mixes DTensor
+    (from FSDP2-managed shards) and plain nn.Parameter (e.g. DDP-style root
+    replicas under PI0's ``replicate_non_layer_modules`` path). Splitting them
+    into separate param_groups lets fused AdamW handle each homogeneously.
+
+    Accepts either a flat tensor list or a list of param_group dicts. Returns
+    the same shape, preserving per-group metadata (lr / weight_decay /
+    group_name); when a mixed group is split, the regular half gets
+    ``" (regular)"`` appended to ``group_name`` for log clarity.
+    """
+    from torch.distributed.tensor import DTensor
+
+    if not params_or_groups:
+        return params_or_groups
+
+    if isinstance(params_or_groups[0], dict):
+        out = []
+        for g in params_or_groups:
+            dt = [p for p in g["params"] if isinstance(p, DTensor)]
+            reg = [p for p in g["params"] if not isinstance(p, DTensor)]
+            if dt and reg:
+                g_dt = {**g, "params": dt}
+                g_reg = {**g, "params": reg}
+                if "group_name" in g_reg:
+                    g_reg["group_name"] = f"{g_reg['group_name']} (regular)"
+                out.extend([g_dt, g_reg])
+            else:
+                out.append(g)
+        return out
+
+    dt = [p for p in params_or_groups if isinstance(p, DTensor)]
+    reg = [p for p in params_or_groups if not isinstance(p, DTensor)]
+    if dt and reg:
+        return [
+            {"params": dt, "group_name": "base"},
+            {"params": reg, "group_name": "base (regular)"},
+        ]
+    return params_or_groups
+
+
 def get_adamw_optimizer(model, *, opt_cfg, param_groups=None):
     """Build AdamW from AdamWConfig."""
     from wall_x.config.hyperparams_config import AdamWConfig
@@ -212,6 +255,9 @@ def get_adamw_optimizer(model, *, opt_cfg, param_groups=None):
         # defaults. Extra keys like ``group_name`` are kept in-place and used
         # downstream for per-group lr logging.
         params = param_groups
+
+    # _fused_adamw_ kernel cannot mix DTensor + regular Tensor in one group.
+    params = _split_dtensor_regular_groups(params)
 
     kw = {
         "lr": opt_cfg.learning_rate,

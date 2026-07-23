@@ -14,7 +14,7 @@ from transformers import AutoProcessor
 
 from wall_x.model.core.action.normalizer import Normalizer
 from wall_x.model.qact.tokenizer_mixin import get_action_tokenizer_mixin
-from wall_x.utils.metrics import dtw_distance, frechet_distance, get_action_accuracy
+from wall_x.utils.metrics import get_action_accuracy, dtw_distance, frechet_distance
 
 _logger = logging.getLogger(__name__)
 
@@ -225,18 +225,20 @@ def update_model_config(train_config, model_config):
         "action_horizon_flow", 32
     )
 
-    if train_config.get("_attn_implementation", None) is not None:
-        model_config._attn_implementation = train_config["_attn_implementation"]
+    attn_impl = train_config.get(
+        "_attn_implementation", train_config.get("attn_implementation")
+    )
+    if attn_impl is not None:
+        model_config._attn_implementation = attn_impl
 
-    if train_config.get("attn_deterministic", None) is not None:
-        model_config.attn_deterministic = train_config["attn_deterministic"]
-        model_config.vision_config.attn_deterministic = train_config[
-            "attn_deterministic"
-        ]
+    # attn_deterministic is no longer a standalone knob — it is derived from the
+    # single ``hyperparams.deterministic_algorithms`` switch so "turn determinism
+    # on" enables all paths (incl. attention kernels) at once (MR !556 review).
+    _det = train_config.get("hyperparams", {}).get("deterministic_algorithms", False)
+    model_config.attn_deterministic = _det
+    model_config.vision_config.attn_deterministic = _det
+    if _det:
         _logger.info("Attention is using deterministic kernel for this run")
-    else:
-        model_config.attn_deterministic = True
-        model_config.vision_config.attn_deterministic = True
 
     if train_config.get("noise_scheduler", None) is not None:
         model_config.noise_scheduler = train_config["noise_scheduler"]
@@ -281,14 +283,49 @@ def print_rank_last(message):
         _logger.info(message)
 
 
-def seed_all(seed):
+def seed_all(seed, deterministic_algorithms: bool = False):
+    """Seed RNGs; opt into strong determinism via ``deterministic_algorithms``.
+
+    Strong determinism (deterministic algorithms + cudnn.deterministic + the
+    cublas workspace pin) inserts fill/elementwise kernels and disables the cudnn
+    autotuner, measurably lowering training MFU. Default is performance mode;
+    enable it only for bitwise-reproducible experiments via the yaml switch
+    ``hyperparams.deterministic_algorithms`` — the single determinism knob, with
+    no environment-variable override. See docs qwen35_mfu_report.
+    """
+    # RNG seed 不算「确定性算法」——任何 run 都需要 seed，否则 random op 不可复现。
+    # 这部分跟 flag 无关，永远调。
     np.random.seed(seed)
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
     os.environ["PYTHONHASHSEED"] = str(seed)
+
+    if deterministic_algorithms:
+        # 严格确定性套餐：cudnn 锁 deterministic kernel + benchmark 关 + torch 全 op 走
+        # 确定性实现。same-seed + same-yaml 两次 run 在 pi0 路径下 step 0 forward
+        # byte-equal、grad 单步 drift < 1e-3。唯一开关是 yaml 的
+        # hyperparams.deterministic_algorithms（无环境变量旁路）。
+        # CUBLAS_WORKSPACE_CONFIG 只 setdefault 兜底——launch 脚本显式 export 的值
+        # 优先；不设则 PyTorch 第一个 cuBLAS 调用就 raise RuntimeError。
+        # warn_only=True 内置：bf16 训练里总有几个 op 没确定实现（如某些 scatter_add
+        # 路径），warn 比 crash 实用——拿大部分 deterministic 收益即可。
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    else:
+        # perf 套餐：cudnn 自由选最快 algo（含 nondet variant），但 benchmark 不默认开：
+        # benchmark=True 对每个新 conv 配置做一轮算法竞速，动态 shape 负载（如 Qwen3.5
+        # vision Conv3d patch_embed）几乎每步撞新 shape、反复付竞速成本，step time 3.2x
+        # 回退（TR-017 实测 MFU 37.7%→11.7%）。固定 shape 负载（LIBERO 224 / pi05
+        # SigLIP Conv2d）warm-up 一次后收益为正——已实测过收益的固定 shape 场景可用
+        # WALLX_CUDNN_BENCHMARK=1 显式开启，不走全局默认。
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = os.environ.get(
+            "WALLX_CUDNN_BENCHMARK", "0"
+        ).lower() in ("1", "true")
+        torch.use_deterministic_algorithms(False)
 
 
 def save_text_results_to_file(
@@ -423,7 +460,7 @@ def compute_action_metrics(all_preds, all_actions, config, step_log={}):
     return step_log
 
 
-def get_warmup_cosine_schedule(
+def get_openpi_cosine_schedule_with_warmup(
     optimizer,
     num_warmup_steps: int,
     num_training_steps: int,
@@ -432,7 +469,7 @@ def get_warmup_cosine_schedule(
     last_epoch: int = -1,
 ):
     """
-    Create a schedule with linear warmup followed by cosine decay:
+    Create a schedule with a learning rate that follows OpenPI style:
     - Warmup: linearly increases from peak_lr/(warmup_steps+1) to peak_lr
     - Decay: cosine decay from peak_lr to end_lr
 
@@ -454,7 +491,7 @@ def get_warmup_cosine_schedule(
 
     def lr_lambda(current_step: int):
         if current_step < num_warmup_steps:
-            # Start from peak_lr / (warmup_steps + 1).
+            # OpenPI warmup: start from peak_lr / (warmup_steps + 1)
             init_lr = peak_lr / (num_warmup_steps + 1)
             current_lr = init_lr + (peak_lr - init_lr) * current_step / num_warmup_steps
             return current_lr / peak_lr  # LambdaLR multiplies by base_lr
@@ -476,6 +513,8 @@ def plot_openloop(
     episode_index,
     save_path,
     is_static_list=None,
+    dim_labels=None,
+    skip_all_nan=False,
 ):
     """
     Plot openloop action comparison visualization.
@@ -487,6 +526,12 @@ def plot_openloop(
         episode_index: Index of the episode being visualized
         save_path: Directory path to save the plot
         is_static_list: Optional list of booleans indicating static frames
+        dim_labels: Optional per-dim subplot names (e.g. ``left_x`` /
+            ``left_gripper`` / ``left_thumb_cmc_abduction``). Each subplot title
+            is this name; falls back to ``Action Dimension i`` when not given.
+        skip_all_nan: When True, drop dims whose L1 is all-NaN (padded DOF such
+            as a dexterous hand's gripper or vendor-absent joints) so they don't
+            add empty subplots.
     """
     import matplotlib
 
@@ -498,10 +543,16 @@ def plot_openloop(
     ), "Predicted action and ground truth action must have the same shape."
 
     dim = action_pred_list[0].shape[1]
-    plt.figure(figsize=(12, 4 * dim))
+    dims = list(range(dim))
+    if skip_all_nan:
+        dims = [i for i in dims if np.any(~np.isnan(l1_loss[:, i]))]
+    if not dims:
+        return
+    n = len(dims)
+    plt.figure(figsize=(12, 4 * n))
 
-    for i in range(dim):
-        plt.subplot(dim, 1, i + 1)
+    for sp, i in enumerate(dims):
+        plt.subplot(n, 1, sp + 1)
 
         has_labeled_static = False
         for j in range(len(action_gt_list)):
@@ -559,13 +610,33 @@ def plot_openloop(
                     markersize=4,
                 )
 
-        plt.title(f"Action Dimension {i + 1}, L1 Loss: {l1_loss[:, i].mean():.6f}")
-        plt.xlabel("Number of Chunk")
+        # Mark chunk boundaries: each chunk is an INDEPENDENT open-loop
+        # re-prediction (new observation + freshly sampled flow noise), so the
+        # curve legitimately jumps at integer x. The line within [j, j+1] is one
+        # chunk's full action_horizon-step prediction, not overlaid per-frame.
+        for b in range(1, len(action_gt_list)):
+            plt.axvline(
+                b,
+                color="green",
+                linestyle=":",
+                alpha=0.35,
+                linewidth=1,
+                label="Chunk boundary" if b == 1 else None,
+            )
+
+        name = (
+            dim_labels[i]
+            if dim_labels is not None and i < len(dim_labels)
+            else f"Action Dimension {i + 1}"
+        )
+        plt.title(f"{name}, L1 Loss: {np.nanmean(l1_loss[:, i]):.6f}")
+        plt.xlabel("Chunk index (each unit = one action_horizon prediction)")
         plt.ylabel("Action Value")
         plt.legend()
 
     plt.suptitle(
-        f"Openloop Action Comparison for Episode {episode_index}, L1 Loss: {l1_loss.mean():.6f}"
+        f"Openloop Action Comparison for Episode {episode_index}, "
+        f"L1 Loss: {np.nanmean(l1_loss):.6f}"
     )
     plt.tight_layout(rect=[0, 0, 1, 0.98])
     os.makedirs(save_path, exist_ok=True)

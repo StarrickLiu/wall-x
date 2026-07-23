@@ -3,22 +3,37 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint as cp
-from peft import LoraConfig, get_peft_model
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
 from torch.distributed.fsdp import MixedPrecision as MP
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+
+from peft import LoraConfig, get_peft_model
+
 from transformers import GenerationMixin
 from transformers.utils import logging
 
-from wall_x.model.core.action.moe import SparseMoeBlock, TokenTypeRouter
-from wall_x.model.core.action.processor import ActionProcessor
-from wall_x.model.core.attention.mask import (
-    update_joint_attention_flash_mask,
-    update_joint_attention_mask_2d,
-    update_position_ids,
-)
 from wall_x.utils.constant import is_action_dataset_name
 
+from wall_x.model.core.action.processor import ActionProcessor
+from wall_x.model.core.action.moe import (
+    TokenTypeRouter,
+    SparseMoeBlock,
+)
+from wall_x.model.core.action.layout import TwoExpertLayout, prepare_two_expert_layout
+from wall_x.model.core.ops.attention_mask import (
+    update_position_ids,
+    update_joint_attention_mask_2d,
+    update_joint_attention_flash_mask,
+)
+
 logger = logging.get_logger(__name__)
+
+
+def _adarms_horizon(config, cond):
+    if isinstance(cond, torch.Tensor) and cond.dim() == 3:
+        return cond.shape[1]
+    return config.action_horizon_flow
 
 
 class ActionModelMixMin:
@@ -45,10 +60,23 @@ class ActionModelMixMin:
                 "ActionModelMixMin.set_normalizer is called but action_preprocessor is not set"
             )
 
-    def _apply_mlp_moe(self, hidden_states, token_types, start_indices, end_indices):
+    def _apply_mlp_moe(
+        self,
+        hidden_states,
+        token_types,
+        action_starts=None,
+        action_ends=None,
+        expert_segments=None,
+        two_expert_layout: TwoExpertLayout = None,
+    ):
         if self.config.mlp_moe:
             hidden_states = self.moe(
-                hidden_states, token_types, start_indices, end_indices
+                hidden_states,
+                token_types,
+                action_starts,
+                action_ends,
+                expert_segments,
+                two_expert_layout,
             )
         else:
             hidden_states = self.mlp(hidden_states)
@@ -61,8 +89,10 @@ class ActionModelMixMin:
         adarms_conds,
         norms,  # list of norm layers (expert-wise)
         norm,  # shared norm if not norm_moe
-        start_indices=None,
-        end_indices=None,
+        action_starts=None,
+        action_ends=None,
+        expert_segments=None,
+        two_expert_layout: TwoExpertLayout = None,
         use_selective_recompute=False,
     ):
         """
@@ -81,14 +111,24 @@ class ActionModelMixMin:
         if self.config.norm_moe:
 
             # ---------------------------------------------------------
-            # Case 1A: mot_opt=True (segments assigned by start/end)
+            # Case 1A: mot_opt=True (segments assigned by fixed LLM/action layout)
             # ---------------------------------------------------------
             if self.config.mot_opt:
                 new_hidden_states = torch.zeros_like(hidden_states)
+                batch_size, seq_length = token_types.shape
+                if two_expert_layout is None:
+                    two_expert_layout = prepare_two_expert_layout(
+                        token_types,
+                        batch_size=batch_size,
+                        seq_length=seq_length,
+                        action_starts=action_starts,
+                        action_ends=action_ends,
+                        device=hidden_states.device,
+                    )
+                expert_segments = two_expert_layout.expert_segments
 
                 for expert_idx, expert_norm in enumerate(norms):
-                    start = start_indices[expert_idx]
-                    end = end_indices[expert_idx]
+                    start, end = expert_segments[expert_idx]
                     if start == end:
                         continue
 
@@ -97,9 +137,12 @@ class ActionModelMixMin:
 
                     # ====== reshape if adarms on flow expert ======
                     if self.config.use_adarms and expert_idx == 1:
+                        action_horizon = _adarms_horizon(
+                            self.config, adarms_conds[expert_idx]
+                        )
                         selected = selected.view(
                             -1,
-                            self.config.action_horizon_flow,
+                            action_horizon,
                             selected.shape[-1],
                         )
                         input_slice = selected[:, :, :dim_input]
@@ -160,10 +203,13 @@ class ActionModelMixMin:
                     selected = hidden_states[mask]  # [K, D]
 
                     if self.config.use_adarms and expert_idx == 1:
+                        action_horizon = _adarms_horizon(
+                            self.config, adarms_conds[expert_idx]
+                        )
                         gate_mask = mask
                         selected = selected.view(
                             -1,
-                            self.config.action_horizon_flow,
+                            action_horizon,
                             selected.shape[-1],
                         )
                         input_slice = selected[:, :, :dim_input]
@@ -231,7 +277,17 @@ class ActionModelMixMin:
 
         return hidden_states, gate, gate_mask
 
-    def _gated_residual(self, x, y, gate, start_indices=None, end_indices=None):
+    def _gated_residual(
+        self,
+        x,
+        y,
+        gate,
+        token_types=None,
+        action_starts=None,
+        action_ends=None,
+        expert_segments=None,
+        two_expert_layout: TwoExpertLayout = None,
+    ):
         """
         Applies gated residual connection with optional gate parameter.
 
@@ -251,14 +307,47 @@ class ActionModelMixMin:
             return x + y
 
         new_y = y.clone()
-        selected_y = y[start_indices[1] : end_indices[1]]
-        selected_y = selected_y.view(
-            -1, self.config.action_horizon_flow, selected_y.shape[-1]
-        )[:, :, : self.config.dim_inputs[1]]
-        selected_y = selected_y.to(torch.float32) * gate
-        new_y[start_indices[1] : end_indices[1], : self.config.dim_inputs[1]] = (
-            selected_y.view(-1, self.config.dim_inputs[1]).to(new_y.dtype)
+        if self.config.mot_opt:
+            if two_expert_layout is None:
+                if token_types is None:
+                    raise ValueError(
+                        "token_types or two_expert_layout must be provided for "
+                        "mot_opt gated residual"
+                    )
+                batch_size, seq_length = token_types.shape
+                two_expert_layout = prepare_two_expert_layout(
+                    token_types,
+                    batch_size=batch_size,
+                    seq_length=seq_length,
+                    action_starts=action_starts,
+                    action_ends=action_ends,
+                    device=y.device,
+                )
+            _, action_segment = two_expert_layout.expert_segments
+            start, end = action_segment
+            selected_y = y[start:end]
+        else:
+            if token_types is None:
+                raise ValueError("token_types must be provided for gated residual")
+            action_mask = token_types == 1
+            selected_y = y[action_mask]
+
+        # ours (align_cw): dynamic action horizon — use gate's horizon dim when the
+        # gate is 3-D with horizon>1, else fall back to the static action_horizon_flow.
+        action_horizon = (
+            gate.shape[1]
+            if isinstance(gate, torch.Tensor) and gate.dim() == 3 and gate.shape[1] > 1
+            else self.config.action_horizon_flow
         )
+        selected_y = selected_y.view(-1, action_horizon, selected_y.shape[-1])[
+            :, :, : self.config.dim_inputs[1]
+        ]
+        selected_y = selected_y.to(torch.float32) * gate
+        selected_y = selected_y.view(-1, self.config.dim_inputs[1]).to(new_y.dtype)
+        if self.config.mot_opt:
+            new_y[start:end, : self.config.dim_inputs[1]] = selected_y
+        else:
+            new_y[action_mask, : self.config.dim_inputs[1]] = selected_y
 
         return x + new_y
 
@@ -340,7 +429,14 @@ class ActionModelMixMin:
         )
 
     def _update_joint_attention_flash_mask(
-        self, attention_mask, moe_token_types, positional_masks, debug=False
+        self,
+        attention_mask,
+        moe_token_types,
+        positional_masks,
+        debug=False,
+        batch_size=None,
+        seq_len=None,
+        device=None,
     ):
         return update_joint_attention_flash_mask(
             attention_mask,
@@ -348,6 +444,9 @@ class ActionModelMixMin:
             positional_masks,
             causal_action_attention_mask=self.config.causal_action_attention_mask,
             debug=debug,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            device=device,
         )
 
 
@@ -401,11 +500,11 @@ class ActionGenerationMixin(GenerationMixin):
                 cast_root_forward_inputs=False,
             )
 
-            from wall_x.model.qact.qwen2_5.modeling_qwen2_5_vl import (
-                Qwen2_5_VLVisionBlock,
-            )
             from wall_x.model.qact.qwen2_5.modeling_qwen2_5_vl_act import (
                 Qwen2_5_VLDecoderLayer_with_MoE,
+            )
+            from wall_x.model.qact.qwen2_5.modeling_qwen2_5_vl import (
+                Qwen2_5_VLVisionBlock,
             )
 
             target_classes = (
@@ -413,7 +512,7 @@ class ActionGenerationMixin(GenerationMixin):
                 Qwen2_5_VLVisionBlock,
             )
 
-            # Step 1: Find top-level ActionProcessor modules and wrap them separately with FSDP (FP32)
+            # Step 1️⃣: Find top-level ActionProcessor modules and wrap them separately with FSDP (FP32)
             for name, module in list(self.named_modules()):
                 if isinstance(module, nn.Module) and any(
                     k in name.lower()
@@ -421,6 +520,7 @@ class ActionGenerationMixin(GenerationMixin):
                         "input_layernorm",
                         "post_attention_layernorm",
                         "model.norm",
+                        "pos_embed",
                         "action_preprocessor",
                     ]
                 ):
@@ -461,7 +561,7 @@ class ActionGenerationMixin(GenerationMixin):
                     _assign_child(self, name, wrapped)
                     setattr(wrapped, "_fsdp_wrapped", True)
 
-            # Step 2: Wrap the outer module with FSDP using the BF16 policy
+            # Step 2️⃣: Wrap the outer module with FSDP using the BF16 policy
             logger.info("[FSDP v1] wrapping root model with bf16 mixed precision...")
             self = FSDP(
                 self,
@@ -485,6 +585,7 @@ class ActionGenerationMixin(GenerationMixin):
                         "input_layernorm",
                         "post_attention_layernorm",
                         "model.norm",
+                        "pos_embed",
                         "action_preprocessor",
                         "action_processor",
                     ]
@@ -657,7 +758,7 @@ class ActionGenerationMixin(GenerationMixin):
                 with torch.no_grad():
                     cross_entropy_loss.detach()
 
-            # compute action token accuracy(computed uniformly through tokenizer_mixin)
+            # compute action token accuracy（computed uniformly through tokenizer_mixin）
             # if self.tokenizer_mixin is not None and self.action_mapper is not None:
             #     accuracy_dict = self.tokenizer_mixin.compute_accuracy(
             #         logits, labels, self.action_mapper, self.action_token_id_set
