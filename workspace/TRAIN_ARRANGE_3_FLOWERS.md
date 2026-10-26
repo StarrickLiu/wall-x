@@ -4,6 +4,8 @@
 
 任务：双臂机器人 **三花插花**，flow 动作预测，推理指令示例：`arrange flower`。
 
+> **当前 Qwen3.5 loader 不能直接开训。** 本文档、示例 YAML 和 `x2robot2lerobot.py` 只保留数据与配置说明。相对 6D 动作和 #118 的尾部自由度截断还没接回这份 loader；归一化脚本里的 `_relative` 统计也因此和训练读数不一致。训练适配另开 PR，不要把下面的命令当成可复现的训练流程。
+
 ---
 
 ## 1. 任务与动作空间
@@ -25,11 +27,11 @@
 |------|------|------|
 | 左臂相对位姿 + 夹爪 | 3 + 6 + 1 = 10 | `follow_left_ee_*_relative` + gripper |
 | 右臂相对位姿 + 夹爪 | 3 + 6 + 1 = 10 | `follow_right_ee_*_relative` + gripper |
-| **有效动作合计** | **20** | loader 从数据集向量中取前 20 维 |
+| **有效动作合计** | **20** | 目标动作空间；当前 loader 不会自动丢掉尾部维度 |
 | `action_padding` | 6 | 虚拟填充，loss 不反传 |
 | **模型输入合计** | **26** | 与 Wall-OSS-0.5 预训练空间一致 |
 
-> 若 LeRobot 数据集中 `action` / `observation.state` 为 **26 维**（含额外 DOF），训练配置通过 `dof_config` + loader 截断，只使用前 20 维有效双臂数据。
+> 目标布局是 26 维向量里的前 20 维双臂分量，其余 6 维用 `action_padding` 占位。当前 loader 不会按 `dof_config` 截断，26 维数据不能直接按本文档训练。
 
 示例训练配置位于 `workspace/example/`（复制后按实际路径修改）。
 
@@ -130,7 +132,7 @@ data:
 
 ### 3.2 维度与内容
 
-- `observation.state` / `action` 建议为 **26 维**；若含额外 DOF，训练时按 `dof_config` 自动截取前 20 维双臂分量
+- `observation.state` / `action` 的目标布局是 **26 维**（前 20 维双臂 + 6 维 padding）。当前 loader 不会自动截取前 20 维
 - 相机原始分辨率不限，训练时统一 resize 到 448×448
 - 数据集需符合 LeRobot v3 目录结构（含 `meta/`、`data/` 等）
 
@@ -151,7 +153,7 @@ python scripts/compute_norm_stats.py \
 脚本会：
 
 - 读取 YAML 中的 `dof_config` / `agent_pos_config` / `action_horizon`
-- 对 `_relative` 键做与训练 loader 一致的相对位姿统计
+- 对 `_relative` 键按相对位姿计算统计。当前训练 loader 还没有同一套相对位姿转换，统计结果不能直接用于开训
 - 输出 20 维有效 DOF 的 mean/std/q01/q99（state 与 action 各一份）
 
 ---
@@ -354,7 +356,7 @@ python scripts/draw_openloop_plot.py \
 
 ### Q3: 数据集 26 维但训练只要 20 维
 
-**说明**：预期行为。loader 按 `dof_config` 截取前 20 维双臂分量，`action_padding(6)` 在模型侧补齐到 26 维。
+**说明**：这是目标布局，不是当前 loader 的行为。当前 loader 不会按 `dof_config` 截取前 20 维，也不能靠 `action_padding(6)` 在读数据时补齐。
 
 ### Q4: 显存不足
 
@@ -364,7 +366,7 @@ python scripts/draw_openloop_plot.py \
 
 ### Q5: lerobot 版本不对
 
-固定使用 **v0.4.4** tag，`pip install --no-deps -e .` 安装。
+与仓库根目录 README 相同：`pip install --no-deps lerobot==0.4.4`。
 
 ---
 
