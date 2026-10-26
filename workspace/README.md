@@ -18,13 +18,16 @@ This guide explains how to fine-tune, evaluate in simulation, and deploy on real
 
 | 文档 | 用途 |
 |------|------|
-| [TRAIN_ARRANGE_3_FLOWERS.md](./TRAIN_ARRANGE_3_FLOWERS.md) | 插花数据与配置说明。当前 Qwen3.5 loader 还不能直接训练该任务，见该文档文首说明 |
+| [TRAIN_ARRANGE_3_FLOWERS.md](./TRAIN_ARRANGE_3_FLOWERS.md) | 插花训练示例。loader 会截断尾部自由度并做相对 6D 转换 |
 | [rtx5090/DEPLOY.md](./rtx5090/DEPLOY.md) | **RTX 5090 推理部署（通用）**：环境安装、服务启动、排障与检查清单 |
 | [rtx5090/README.md](./rtx5090/README.md) | RTX 5090 快速开始：一键脚本与目录说明 |
 
 **快速入口（在仓库根目录执行）：**
 
 ```bash
+# 训练：复制 workspace/example/ 下插花 YAML，改路径后
+torchrun --nproc_per_node=4 wall_x/trainer/fsdp_trainer/train_fsdp.py --config /path/to/my_flowers_train.yml
+
 # 推理：配置 workspace/rtx5090/local/env.sh 后
 bash workspace/rtx5090/install.sh
 bash workspace/rtx5090/run_server.sh
