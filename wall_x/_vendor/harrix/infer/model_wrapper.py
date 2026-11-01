@@ -21,6 +21,52 @@ from wall_x._vendor.x2robot_utils.text_templates import (
 from wall_x._vendor.x2robot_utils.text_templates import (
     _PUBLIC_CAMERA_LABELS as _CAM_NAME_MAPPING,
 )
+
+
+def camera_prompt_label(cam_name, camera_name_mapping, public_labels):
+    """Label a camera in the prompt.
+
+    Training writes the dataset key (``face_view``) unless
+    ``data.camera_name_mapping`` renames it. Public labels (``front view``)
+    stay the default for checkpoints trained with those words.
+    """
+    if isinstance(camera_name_mapping, dict):
+        label = camera_name_mapping.get(cam_name)
+        if label:
+            return str(label)
+    return public_labels.get(cam_name, cam_name)
+
+
+def apply_fixed_zero_state(agent_pos, agent_pos_mask, layout, keys):
+    """Write selected proprio dims to physical 0 and keep their mask on.
+
+    ``agent_pos`` is unnormalized, shape ``[..., D]`` in ``layout`` order.
+    """
+    if not keys:
+        return agent_pos, agent_pos_mask
+    wanted = [str(key) for key in keys]
+    found = set()
+    cursor = 0
+    for name, dim in layout.items():
+        dim = int(dim)
+        bare = name
+        for prefix in ("follow_", "master_"):
+            if bare.startswith(prefix):
+                bare = bare[len(prefix) :]
+                break
+        if name in wanted or bare in wanted:
+            agent_pos[..., cursor : cursor + dim] = 0
+            agent_pos_mask[..., cursor : cursor + dim] = 1
+            found.add(name)
+            found.add(bare)
+        cursor += dim
+    missing = [key for key in wanted if key not in found]
+    if missing:
+        raise ValueError(
+            "fixed_zero_state_keys not in agent_pos_config: "
+            f"{missing}; layout={list(layout)}"
+        )
+    return agent_pos, agent_pos_mask
 from wall_x._vendor.x2robot_utils.grounding import (
     reverse_grounding_points,
     extract_grounding_points,
@@ -516,6 +562,9 @@ class WallxModelWrapper:
             agent_pos = torch.cat(agent_pos_list, dim=0)
             agent_pos_mask = torch.cat(agent_pos_mask_list, dim=0)
             dof_mask = torch.cat(dof_mask_list, dim=0)
+            agent_pos, agent_pos_mask = self._apply_fixed_zero_state(
+                agent_pos, agent_pos_mask
+            )
 
             if self.normalizer_propri is not None:
                 agent_pos = self.normalizer_propri.normalize_data(
@@ -637,7 +686,7 @@ class WallxModelWrapper:
             display_name = (
                 dataset_text_processor.cam_name_mapping.get(cam_name, cam_name)
                 if dataset_text_processor is not None
-                else _CAM_NAME_MAPPING[cam_name]
+                else self._camera_prompt_label(cam_name)
             )
             user_request += (
                 f" {display_name}: {self.vision_start_symbol}"
@@ -677,7 +726,7 @@ class WallxModelWrapper:
                     cam_name, cam_name
                 )
             else:
-                display_name = _CAM_NAME_MAPPING[cam_name]
+                display_name = self._camera_prompt_label(cam_name)
             user_request += (
                 f" {display_name}: {self.vision_start_symbol}"
                 f"{self.image_pad_symbol}{self.vision_end_symbol}"
@@ -732,6 +781,25 @@ class WallxModelWrapper:
         postfix_text = flow_action
 
         return prefix_text, postfix_text
+
+    def _camera_prompt_label(self, cam_name):
+        data = self.config.train_config.get("data") or {}
+        return camera_prompt_label(
+            cam_name, data.get("camera_name_mapping"), _CAM_NAME_MAPPING
+        )
+
+    def _apply_fixed_zero_state(self, agent_pos, agent_pos_mask):
+        data = self.config.train_config.get("data") or {}
+        keys = data.get("fixed_zero_state_keys") or []
+        if not keys:
+            return agent_pos, agent_pos_mask
+        layout = self.config.train_config.get("agent_pos_config") or {}
+        if not getattr(self, "_logged_fixed_zero_state", False):
+            self.logger.info(
+                "forcing proprio dims to physical 0 with mask 1: %s", list(keys)
+            )
+            self._logged_fixed_zero_state = True
+        return apply_fixed_zero_state(agent_pos, agent_pos_mask, layout, keys)
 
     def _configured_system_prompt(self):
         return (self.config.train_config.get("data") or {}).get("system_prompt")
@@ -808,7 +876,7 @@ class WallxModelWrapper:
         prologue = f"{self.role_start_symbol}system\n{system_prompt}{self.role_end_symbol}\n"
         user_request = f"{self.role_start_symbol}user\nObservation:"
         for cam_name in self.cam_names:
-            user_request += f" {_CAM_NAME_MAPPING[cam_name]}: {self.vision_start_symbol}{self.image_pad_symbol}{self.vision_end_symbol}"
+            user_request += f" {self._camera_prompt_label(cam_name)}: {self.vision_start_symbol}{self.image_pad_symbol}{self.vision_end_symbol}"
         user_request += f"\n{self._instruction_label()}:"
         text_prompt = "\nPredict the next action in language.\n"
         user_message = (

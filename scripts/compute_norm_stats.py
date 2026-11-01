@@ -68,9 +68,10 @@ from wall_x._vendor.x2robot_utils.geometry import (
     so3_to_matrix_batch_nb,
 )
 
-SKIP_DOF_KEYS = frozenset(
-    {"velocity_decomposed", "height", "head_actions", "action_padding"}
-)
+# Match the LeRobot loader: only virtual action_padding is absent from the
+# on-disk vector. Trailing velocity/height/head are truncated by width when
+# the configured layout is shorter than the dataset vector.
+SKIP_DOF_KEYS = frozenset({"action_padding"})
 
 
 @dataclass
@@ -82,6 +83,8 @@ class TrainConfigContext:
     propri_ranges: dict[str, list[int]]
     action_ranges: dict[str, list[int]]
     action_chunk: int
+    dof_config: dict[str, int]
+    agent_pos_config: dict[str, int]
 
 
 def write_norm_stats(path: Path, norm_stats: dict[str, dict]) -> None:
@@ -184,7 +187,88 @@ def parse_train_config(config: dict[str, Any]) -> TrainConfigContext:
         propri_ranges=config_to_index_ranges(agent_pos_config),
         action_ranges=config_to_index_ranges(dof_config),
         action_chunk=action_chunk,
+        dof_config={str(k): int(v) for k, v in dof_config.items()},
+        agent_pos_config={str(k): int(v) for k, v in agent_pos_config.items()},
     )
+
+
+def layout_vector_dim(layout_config: dict[str, int]) -> int:
+    """Config vector width excluding virtual padding keys."""
+    return sum(
+        int(dim) for key, dim in layout_config.items() if key not in SKIP_DOF_KEYS
+    )
+
+
+def _prepare_arrays_for_layout(
+    states: np.ndarray,
+    actions: np.ndarray,
+    agent_pos_config: dict[str, int],
+    dof_config: dict[str, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Match the LeRobot loader: truncate trailing DOFs, then Euler to 6D."""
+    from wall_x.data.backends.lerobot.rotation_layout import (
+        euler_layout_dim,
+        layout_uses_6d_rotation,
+        maybe_convert_euler_to_6d,
+    )
+
+    expected_state_dim = layout_vector_dim(agent_pos_config)
+    expected_action_dim = layout_vector_dim(dof_config)
+    if states.shape[-1] > expected_state_dim:
+        logging.warning(
+            "Truncating state from %d to layout dim %d (dropping trailing DOFs)",
+            states.shape[-1],
+            expected_state_dim,
+        )
+        states = states[..., :expected_state_dim]
+    if actions.shape[-1] > expected_action_dim:
+        logging.warning(
+            "Truncating action from %d to layout dim %d (dropping trailing DOFs)",
+            actions.shape[-1],
+            expected_action_dim,
+        )
+        actions = actions[..., :expected_action_dim]
+
+    convert_state = layout_uses_6d_rotation(agent_pos_config)
+    convert_action = layout_uses_6d_rotation(dof_config)
+
+    if convert_state:
+        raw_dim = euler_layout_dim(agent_pos_config)
+        target_dim = layout_vector_dim(agent_pos_config)
+        if states.shape[-1] == raw_dim:
+            states = maybe_convert_euler_to_6d(states, agent_pos_config, True)
+            logging.info(
+                "Converted state Euler->6D (%d -> %d dims)", raw_dim, states.shape[-1]
+            )
+        elif states.shape[-1] != target_dim:
+            raise ValueError(
+                f"State dim {states.shape[-1]} does not match Euler raw dim "
+                f"{raw_dim} or 6D layout dim {target_dim} from agent_pos_config"
+            )
+
+    if convert_action:
+        raw_dim = euler_layout_dim(dof_config)
+        target_dim = layout_vector_dim(dof_config)
+        if actions.shape[-1] == raw_dim:
+            actions = maybe_convert_euler_to_6d(actions, dof_config, True)
+            logging.info(
+                "Converted action Euler->6D (%d -> %d dims)", raw_dim, actions.shape[-1]
+            )
+        elif actions.shape[-1] != target_dim:
+            raise ValueError(
+                f"Action dim {actions.shape[-1]} does not match Euler raw dim "
+                f"{raw_dim} or 6D layout dim {target_dim} from dof_config"
+            )
+
+    if states.shape[-1] != expected_state_dim:
+        raise ValueError(
+            f"State dim {states.shape[-1]} != expected layout dim {expected_state_dim}"
+        )
+    if actions.shape[-1] != expected_action_dim:
+        raise ValueError(
+            f"Action dim {actions.shape[-1]} != expected layout dim {expected_action_dim}"
+        )
+    return states, actions
 
 
 def _load_state_action_table(
@@ -421,11 +505,17 @@ def compute_norm_stats_with_dof_config(
     state_key: str = "observation.state",
     action_key: str = "action",
     action_chunk: int = 32,
+    dof_config: dict[str, int] | None = None,
+    agent_pos_config: dict[str, int] | None = None,
 ) -> dict[str, dict]:
     table, state_key, action_key = _load_state_action_table(
         data_root, state_key, action_key
     )
     states, actions = _table_to_arrays(table, state_key, action_key)
+    if dof_config is not None and agent_pos_config is not None:
+        states, actions = _prepare_arrays_for_layout(
+            states, actions, agent_pos_config, dof_config
+        )
     norm_stats = {
         state_key: compute_vector_stats(states),
         action_key: compute_vector_stats(actions),
@@ -495,6 +585,8 @@ def compute_norm_stats(
         state_key=state_key,
         action_key=action_key,
         action_chunk=train_ctx.action_chunk,
+        dof_config=train_ctx.dof_config,
+        agent_pos_config=train_ctx.agent_pos_config,
     )
 
 

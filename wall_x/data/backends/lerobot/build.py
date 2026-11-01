@@ -40,7 +40,12 @@ def load_lerobot_normalizers(cfg: Any):
         )
 
     dataset_name = str(lerobot_config["repo_id"])
-    norm_stats = load_norm_stats(norm_stats_path, key_mappings)
+    norm_stats = load_norm_stats(
+        norm_stats_path,
+        key_mappings,
+        dof_config=dict(cfg.task.dof_config or {}),
+        agent_pos_config=dict(cfg.task.agent_pos_config or {}),
+    )
     normalizer_action, normalizer_propri = create_normalizers_from_lerobot_norm_stats(
         norm_stats,
         dataset_name,
@@ -162,6 +167,7 @@ def _build_flat_config(cfg: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     data = cfg.data
     hp = cfg.hyperparams
     raw = getattr(cfg, "_raw_yaml", {}) or {}
+    raw_data = dict(getattr(cfg, "_raw_data", {}) or {})
 
     lerobot_cfg = dict(data.lerobot_config or {})
     if "repo_id" not in lerobot_cfg:
@@ -177,10 +183,27 @@ def _build_flat_config(cfg: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         "seed": hp.seed,
         "resolution": data.resolution,
     }
+    if raw_data.get("max_length") is not None:
+        data_section["max_length"] = raw_data["max_length"]
+    # Vision resize knobs live in the YAML data section but are not dataclass
+    # fields. The frame loader reads them off this flat dict.
+    for key in ("image_factor", "min_pixels", "max_pixels"):
+        if raw_data.get(key) is not None:
+            data_section[key] = raw_data[key]
+    if getattr(cfg, "model_type", None):
+        data_section.setdefault("model_type", cfg.model_type)
     if data.priority_order is not None:
         data_section["priority_order"] = data.priority_order
     if data.camera_name_mapping is not None:
         data_section["camera_name_mapping"] = data.camera_name_mapping
+    data_section.setdefault(
+        "use_state_string_representation",
+        cfg.task.use_state_string_representation,
+    )
+    data_section.setdefault(
+        "state_bins",
+        raw_data.get("state_bins", getattr(data, "state_bins", 256)),
+    )
 
     # Dof/agent_pos totals for the collator's zero-pad step. When resuming
     # from a checkpoint trained on a larger action space (e.g. bus2602 26-dim
@@ -206,6 +229,15 @@ def _build_flat_config(cfg: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         "noise_scheduler": data.noise_scheduler or {},
         "dof_total_dim": dof_total,
         "agent_pos_total_dim": agent_pos_total,
+        "dof_config": dict(cfg.task.dof_config or {}),
+        "agent_pos_config": dict(cfg.task.agent_pos_config or {}),
+        "use_state_string_representation": cfg.task.use_state_string_representation,
+        "state_bins": int(
+            raw_data.get("state_bins")
+            or data_section.get("state_bins")
+            or getattr(data, "state_bins", None)
+            or 256
+        ),
         "data": data_section,
     }
     return flat, lerobot_cfg

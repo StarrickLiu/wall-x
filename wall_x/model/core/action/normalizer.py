@@ -320,7 +320,9 @@ class Normalizer(nn.Module):
         for x, dataset_name in zip(xs, dataset_names):
             # if dataset_name == "ex_normal":
             # dataset_name = "x2_normal"
-            x = (x - self.min[dataset_name]) / (self.delta[dataset_name])
+            delta = self.delta[dataset_name]
+            delta = torch.where(delta == 0, torch.ones_like(delta), delta)
+            x = (x - self.min[dataset_name]) / delta
             x = x * 2 - 1
             x = torch.clamp(x, -1, 1)
             new_xs.append(x)
