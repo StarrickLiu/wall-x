@@ -277,6 +277,9 @@ class ModelAdapter(ABC):
             ("action_loss", "act_loss", ".6f"),
             ("action_accuracy", "accuracy", ".4f"),
             ("flow_loss", "flow_loss", ".6f"),
+            ("refiner_loss", "refiner", ".6f"),
+            ("refiner_kept", "scored", ".0f"),
+            ("refiner_correction", "correction", ".5f"),
         ]
         if tokenizer_mixin is not None:
             for key in tokenizer_mixin.get_accuracy_keys():

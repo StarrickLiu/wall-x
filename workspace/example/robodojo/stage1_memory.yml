@@ -1,0 +1,202 @@
+# RoboDojo, stage 1 of 2: keyframe memory.
+#
+# Trains a policy that recalls the frames at which the task made progress, and
+# a selector that decides which recent frames to record. The two are trained
+# together on the same episodes: the action samples read a memory, the
+# selection samples learn to write one.
+#
+# It starts from the robot base model our published results started from,
+# published as `x-square-robot/wall-oss-1.0-lite-robodojo-base` -- a preview of
+# Wall-OSS-1.0-lite, trained for a different number of iterations than that
+# release will be.
+#
+# Before training:
+#
+#   1. Fetch the end-effector LeRobot export and the memory annotations:
+#
+#        bash scripts/RoboDojo/download_robodojo_data.sh lerobot_ee
+#        # annotations: see the release's own README
+#
+#      Normalization statistics are not measured: the base model ships the
+#      pair it was pretrained with, and this run reads them from there.
+#
+# Launch (from the repository root):
+#
+#   torchrun --nproc_per_node=8 \
+#     wall_x/trainer/fsdp_trainer/train_fsdp.py \
+#     --config workspace/example/robodojo/stage1_memory.yml
+
+model_type: qwen3_5
+
+task:
+  # 20 dimensions the arms provide, plus 6 this embodiment does not: chassis
+  # velocity, height and head angles are padded and carry no loss.
+  dof_config:
+    master_left_ee_cartesian_pos_relative: 3
+    master_left_ee_rotation_6D_relative: 6
+    master_left_gripper: 1
+    master_right_ee_cartesian_pos_relative: 3
+    master_right_ee_rotation_6D_relative: 6
+    master_right_gripper: 1
+    action_padding: 6
+  agent_pos_config:
+    follow_left_ee_cartesian_pos: 3
+    follow_left_ee_rotation_6D: 6
+    follow_left_gripper: 1
+    follow_right_ee_cartesian_pos: 3
+    follow_right_ee_rotation_6D: 6
+    follow_right_gripper: 1
+  action_horizon: 32
+  action_horizon_flow: 32
+  use_state_string_representation: true
+
+model:
+  backbone: qwen3_5
+  config_path: workspace/models_config/qwen3_5_4B_mot.json
+  processor_path: Qwen/Qwen3.5-4B
+  # The base model this recipe was written for. It carries the normalization
+  # statistics it was trained with, which is where this run reads them from --
+  # the tokenizer and the image processor come from the VLM above.
+  pretrained_path: x-square-robot/wall-oss-1.0-lite-robodojo-base
+  use_ema: false
+  flow_loss_weight: 1.0
+  # The selection answer is text, so it is learned autoregressively alongside
+  # the flow loss on actions. Small: most samples are action samples.
+  #
+  # Each micro-batch averages its own loss, so across one update the two
+  # objectives are weighted by their share of the micro-batches, where the
+  # published run -- which packed both kinds into one sequence -- weighted them
+  # this number to one whatever the mix. Multiply it by the ratio of action
+  # samples to selection samples, both printed at startup, to train with the
+  # published balance instead.
+  ar_loss_weight: 0.02
+  # What this package can install. The faster masked kernel the
+  # published run used is not part of it.
+  attn_implementation: sdpa
+  new_special_tokens:
+    # The selector's vocabulary: write or skip, which candidates, end.
+    - <|kf_write|>
+    - <|kf_skip|>
+    - <|kf_end|>
+    - <|R_0|>
+    - <|R_1|>
+    - <|R_2|>
+    - <|R_3|>
+    - <|R_4|>
+    - <|R_5|>
+    - <|R_6|>
+    - <|R_7|>
+    - <|R_8|>
+    - <|R_9|>
+    - <|R_10|>
+    - <|R_11|>
+    - <|R_12|>
+    - <|R_13|>
+    - <|R_14|>
+    - <|R_15|>
+
+data:
+  dataset_type: robodojo
+  robodojo:
+    # The end-effector export: position, wxyz quaternion and gripper per arm.
+    # Its video is lossy, so pixels differ from a lossless source; see the
+    # policy README.
+    repo_id: RoboDojo-Benchmark/Robodojo
+    root: ../data/RoboDojo_ee_lerobot_v30_video
+    # Where the published memory annotations were unpacked.
+    annotations: ../data/robodojo_memory_annotations
+    # Selection samples teach the model to write its own memory. Without them
+    # it can only read a memory someone else wrote.
+    selection: true
+  memory:
+    # How many recalled frames a prompt may carry, and how far back the
+    # selector looks.
+    capacity: 22
+    window: 48
+    candidates: 16
+    # Recent head-camera frames before the current one. Off here: the released
+    # recipe reached this only for the conveyor task.
+    short_term: 0
+    short_term_stride: 4
+    # Crop a recalled frame to its annotated object, so the memory keeps the
+    # object and not the rest of the demonstration scene.
+    box_crop: true
+    # Vary that crop while training; inference uses the fixed framing.
+    box_jitter: true
+  # Perturbing the observed pose keeps a model from relying on its exact
+  # numbers, and so on the exact normalization behind them. Off, as in the
+  # published run: this base model's action layers were fitted through these
+  # statistics already. Worth turning on when training from a bare VLM.
+  state_noise: null
+  #  position: 0.005      # metres
+  #  rotation: 0.02       # radians
+  #  gripper: 0.01
+  #  probability: 0.5
+  resolution:
+    face_view: 448
+    left_wrist_view: 448
+    right_wrist_view: 448
+  image_factor: 28
+  min_pixels: 3136
+  max_pixels: 1003520
+  state_bins: 255
+  # A selection prompt carries the whole memory and every candidate, so it
+  # is long; truncation would cut the answer off the end. Reaching this
+  # limit is refused rather than trained through.
+  max_length: 28672
+  padding_side: right
+  num_workers: 8
+
+distributed:
+  # DMuon owns each parameter on one rank and shards the rest, which is what
+  # this repository's default configs train with.
+  backend: dmuon
+  bf16: true
+  recompute:
+    enable: true
+    decoder:
+      default: full
+
+hyperparams:
+  seed: 42
+  num_epoch: 1
+  batch_size_per_gpu: 1
+  # A batch holds one kind of sample -- the model pairs action rows with
+  # action-token positions, and a selection sample has none -- so the two
+  # objectives meet here, in one update, rather than inside a batch. The
+  # sampler deals the kinds at their own spacing, so every four batches carry
+  # both in the proportion the dataset does. Raising this raises how faithfully
+  # each update reflects that proportion; lowering it to one makes updates
+  # alternate between the two objectives.
+  gradient_accumulation_steps: 4
+  optimizer:
+    optimizer_type: dmuon
+    # The matrix parameters go to Muon, everything else to AdamW. Both rates
+    # are stated, and both are the same: the defaults are tuned for other runs,
+    # and Muon's usual much larger rate is not what this recipe uses.
+    learning_rate: 1.4e-5
+    muon_lr: 1.4e-5
+    adamw_lr: 1.4e-5
+    max_grad_norm: 1.0
+    enable_grad_clip: true
+    betas: [0.9, 0.95]
+    weight_decay: 1.0e-8
+    eps: 1.0e-8
+  scheduler:
+    scheduler_type: cosine
+    num_warmup_steps: 500
+    num_training_steps: 100000
+    min_lr: 1.4e-6
+
+logging:
+  log_name: robodojo_stage1_memory
+  log_interval: 10
+  save_interval: 10000
+  use_wandb: false
+
+checkpoint:
+  save_path: ./checkpoints/robodojo_stage1_memory
+  resume_from: null
+
+debug:
+  max_steps: 0

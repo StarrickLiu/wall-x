@@ -12,10 +12,12 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from wall_x.model.core.keyframe_memory.boxes import Box
+from wall_x.model.core.keyframe_memory.windows import (
+    candidate_positions,
+    short_term_positions,
+)
 from wall_x.serving.keyframe_memory.config import KeyframeMemoryConfig
-
-# Object box in 0..1000 coordinates of the frame: (x1, y1, x2, y2).
-Box = Tuple[int, int, int, int]
 
 
 @dataclass(frozen=True)
@@ -91,10 +93,11 @@ class KeyframeBank:
         cfg = self.config
         now = state.now
         start = max(0, now - cfg.window)
-        span = max(1, now - start)
         candidates = tuple(
-            _nearest(state.ring, start + int((i + 0.5) * span / cfg.num_candidates))
-            for i in range(cfg.num_candidates)
+            _nearest(state.ring, position)
+            for position in candidate_positions(
+                now, window=cfg.window, count=cfg.num_candidates
+            )
         )
         # The selector only sees memory older than its candidate window, so a
         # frame never appears both as [M_j] and as <|R_i|>.
@@ -137,10 +140,11 @@ class KeyframeBank:
         """Ring frames at ``now - stride * k`` for k = count..1, clamped to the ring."""
         if count <= 0:
             return []
-        oldest = state.oldest
         return [
-            _nearest(state.ring, max(oldest, state.now - k * stride))
-            for k in range(count, 0, -1)
+            _nearest(state.ring, position)
+            for position in short_term_positions(
+                state.now, count=count, stride=stride, oldest=state.oldest
+            )
         ]
 
 

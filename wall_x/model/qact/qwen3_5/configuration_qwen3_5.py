@@ -647,6 +647,13 @@ class Qwen3_5Config(PreTrainedConfig):
         self.vla_config.use_per_token_tau = data_config.get("use_per_token_tau", False)
         self.vla_config.rtc_rope_gap = data_config.get("rtc_rope_gap", 0)
 
+        # The refiner changes the module tree, so a run that asks for it has to
+        # be able to say so from its own config rather than only from the
+        # model json it shares with every other run.
+        refiner = train_config.get("refiner")
+        if refiner is not None:
+            self.vla_config.refiner = refiner
+
         attn_impl = train_config.get(
             "_attn_implementation", train_config.get("attn_implementation")
         )

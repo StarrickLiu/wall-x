@@ -68,6 +68,7 @@ from wall_x.model.core.action.layout import (
 from wall_x.model.core.ops.packed_position_ids import packed_position_ids
 from wall_x.model.core.action.processor import ActionProcessor
 from wall_x.model.core.refiner import RefinerConfig, install_twins
+from wall_x.model.core.refiner.step import RefinerTrainingMixin
 from wall_x.model.qact.qwen3_5.qwen3_5_inference_mixin import Qwen3_5VLAInferenceMixin
 
 
@@ -1211,7 +1212,10 @@ class Qwen3_5_VLAModel(Qwen3_5Model, ActionModelMixMin):
 
 
 class Qwen3_5_VLAForConditionalGeneration(
-    Qwen3_5ForConditionalGeneration, ActionGenerationMixin, Qwen3_5VLAInferenceMixin
+    Qwen3_5ForConditionalGeneration,
+    ActionGenerationMixin,
+    Qwen3_5VLAInferenceMixin,
+    RefinerTrainingMixin,
 ):
     _checkpoint_conversion_mapping = {}
     _tied_weights_keys = {"lm_head.weight": "model.language_model.embed_tokens.weight"}
@@ -1302,13 +1306,43 @@ class Qwen3_5_VLAForConditionalGeneration(
         sample_time: Optional[torch.Tensor] = None,
         flow_loss_mask: Optional[torch.FloatTensor] = None,
         ar_action_loss_weight: Optional[float] = None,
+        # Positions whose answer is scored against a set of accepted tokens
+        # rather than one, and the ids of those sets. See
+        # ``wall_x.model.core.selection_loss``.
+        interval_rows: Optional[torch.LongTensor] = None,
+        interval_accepted: Optional[torch.LongTensor] = None,
         # for history observation
         pixel_values_history: torch.Tensor | None = None,
         image_grid_thw_history: torch.LongTensor | None = None,
         history_image_mask: torch.Tensor | None = None,
         num_history_per_image: list[int] | None = None,
+        mode: Optional[str] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | Qwen3_5VLAModelOutputWithPast:
+
+        if mode == "refiner":
+            # Training the residual refiner means sampling from the base model
+            # first, which reads weights that are only materialized while this
+            # forward runs.
+            return self.refiner_train_forward(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                inputs_embeds=inputs_embeds,
+                pixel_values=pixel_values,
+                pixel_values_videos=pixel_values_videos,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                action_chunk=action_chunk,
+                dof_mask=dof_mask,
+                proprioception=proprioception,
+                agent_pos_mask=agent_pos_mask,
+                dataset_names=dataset_names,
+                pixel_values_history=pixel_values_history,
+                image_grid_thw_history=image_grid_thw_history,
+                history_image_mask=history_image_mask,
+                **kwargs,
+            )
 
         positional_masks = kwargs.get("positional_masks")
         packing_active = bool(
@@ -1437,6 +1471,8 @@ class Qwen3_5_VLAForConditionalGeneration(
             labels=labels,
             action_chunk=loss_action_chunk,
             dof_mask=loss_dof_mask,
+            interval_rows=interval_rows,
+            interval_accepted=interval_accepted,
             flow=flow,
             flow_loss_mask=loss_flow_loss_mask,
             _lm_loss_mask=_lm_loss_mask,
@@ -1729,11 +1765,24 @@ class Qwen3_5_VLAForConditionalGeneration(
                     )
                     fully_shard(child, **fp32_shard_kwargs)
 
+        # The normalization statistics are not weights: they carry no gradient
+        # and they are read outside any module's forward -- the flow sampler
+        # computes a padding velocity from them, validation unnormalizes with
+        # them. A sharded read there mixes a DTensor with a plain tensor and
+        # fails, so they are left whole. There are a few dozen of them.
+        normalizer_params = {
+            param
+            for name, param in self.named_parameters()
+            if "normalizer" in name.lower()
+        }
+
         # action_processor leaves: same fp32 treatment as layernorms.
         for name, module in list(self.named_modules()):
             if not any(
                 k in name.lower() for k in ("action_preprocessor", "action_processor")
             ):
+                continue
+            if "normalizer" in name.lower():
                 continue
             if any(True for _ in module.children()):
                 continue  # only leaves
@@ -1767,8 +1816,9 @@ class Qwen3_5_VLAForConditionalGeneration(
                 print("[FSDP2] fully_shard lm_head (bf16)")
 
         # Root: covers any params not in a nested fully_shard.
-        print("[FSDP2] fully_shard root (bf16)")
-        fully_shard(self, **shard_kwargs)
+        print(f"[FSDP2] fully_shard root (bf16), leaving "
+              f"{len(normalizer_params)} normalizer statistics whole")
+        fully_shard(self, **shard_kwargs, ignored_params=normalizer_params)
         return self
 
     def convert_to_dmuon(

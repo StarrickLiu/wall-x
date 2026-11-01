@@ -69,7 +69,44 @@ class LeRobotDataConfig(DataConfig):
     action_history_length: int = 1
 
 
+@register_data_config("robodojo")
+@dataclass
+class RoboDojoDataConfig(DataConfig):
+    """RoboDojo data config: the official end-effector export plus annotations.
+
+    The three sections are separate because they answer different questions.
+    ``robodojo`` says which data to read, ``memory`` describes the shape of a
+    sample's memory -- how far back the selector looks and how much it may keep
+    -- and ``state_noise`` perturbs the observed pose.
+
+    Unknown keys in a config section are dropped silently by the loader, so a
+    field has to be declared here to be read at all; that is why ``memory`` and
+    the rest are declared even though their contents are plain dicts.
+    """
+
+    dataset_type: str = "robodojo"
+    # ``repo_id``, ``root`` (the downloaded export), ``annotations`` (the
+    # release directory) and ``selection`` (train the selector, or not).
+    robodojo: Optional[Dict[str, Any]] = None
+    memory: Optional[Dict[str, Any]] = None
+    refiner: Optional[Dict[str, Any]] = None
+    state_noise: Optional[Dict[str, Any]] = None
+    # Image geometry, as the processor counts it.
+    image_factor: int = 28
+    min_pixels: int = 3136
+    max_pixels: int = 1003520
+    state_bins: int = 255
+    padding_side: str = "right"
+    num_workers: int = 4
+    noise_scheduler: Optional[Dict[str, Any]] = None
+    # A selection prompt carries the whole memory and every candidate, so it is
+    # long. Truncation would cut the answer off the end and the sample would
+    # train on nothing, silently -- the loss would simply have less to explain.
+    max_length: int = 28672
+
+
 __all__ = [
     "DataConfig",
     "LeRobotDataConfig",
+    "RoboDojoDataConfig",
 ]

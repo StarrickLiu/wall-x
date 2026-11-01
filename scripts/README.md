@@ -114,3 +114,39 @@ whose config has it disabled, is refused at load or first request.
   statistics.
 
 Most scripts support `--help` for their command-line options.
+
+## RoboDojo
+
+`robodojo_smoke.py` writes a two-episode stand-in of a whole RoboDojo setup —
+export, memory annotations, a normalizer and both stage configs — and can push
+a few batches through the real processor. It answers "does this
+machine run the pipeline" before 200 GB is downloaded.
+
+```bash
+python scripts/robodojo_smoke.py --out /tmp/robodojo_smoke \
+    --processor /path/to/Qwen3.5 --check-data
+torchrun --nproc_per_node=1 wall_x/trainer/fsdp_trainer/train_fsdp.py \
+    --config /tmp/robodojo_smoke/stage1_smoke.yml
+```
+
+`calibrate_refiner_margins.py` measures how far the base model's own samples
+fall from the demonstrations, per task, and writes the margins that decide
+which candidates the residual refiner is trained on. They describe the policy
+being refined, so they are measured rather than carried around as constants.
+
+```bash
+python scripts/calibrate_refiner_margins.py \
+    --train-config workspace/example/robodojo/stage2_refiner.yml \
+    --out margins.json
+python scripts/calibrate_refiner_margins.py --self-check   # arithmetic only
+```
+
+The run measures every task it is given, which takes a pass over the data;
+`--episodes N` stops early and measures whichever tasks those batches held.
+Either way the file carries a margin pooled over every candidate measured, and
+a task without one of its own is filtered by that instead of stopping the run.
+
+Normalization statistics are not measured here: they come with the weights. The
+base model ships the pair it was pretrained with, and a stage-2 run inherits
+them from the stage-1 checkpoint it refines — the same weights read a
+different scale if the numbers change under them.

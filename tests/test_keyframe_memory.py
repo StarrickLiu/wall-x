@@ -4,14 +4,14 @@ import numpy as np
 import pytest
 import torch
 
-from wall_x.serving.keyframe_memory.boxes import MIN_SIDE, crop_rect, crop_to_box
+from wall_x.model.core.keyframe_memory.boxes import MIN_SIDE, crop_rect, crop_to_box
 from wall_x.serving.keyframe_memory.config import KeyframeMemoryConfig
 from wall_x.serving.keyframe_memory.grammar import (
     SelectionGrammar,
     SelectionTokens,
     parse_selection,
 )
-from wall_x.serving.keyframe_memory.prompts import IMAGE, inject_memory, selection_prompt
+from wall_x.model.core.keyframe_memory.prompts import IMAGE, inject_memory, selection_prompt
 from wall_x.serving.keyframe_memory.state import (
     Frame,
     KeyframeBank,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 import torch
@@ -32,7 +33,12 @@ def move_batch_to_device(
         trainer uses pinned loaders; pass False if the dataloader hasn't
         pinned memory.
     """
-    if isinstance(batch, dict):
+    # Any mapping, not only ``dict``: a processor hands back a ``BatchFeature``,
+    # which is a ``UserDict`` and fails an ``isinstance(x, dict)`` test. Such a
+    # batch used to be passed through untouched, and training only worked
+    # because one distributed wrapper moved the inputs itself -- on another
+    # backend the first embedding lookup met an index still on the host.
+    if isinstance(batch, Mapping):
         return {
             k: move_batch_to_device(v, device, non_blocking=non_blocking)
             for k, v in batch.items()

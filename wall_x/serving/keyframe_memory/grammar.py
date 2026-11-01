@@ -20,9 +20,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
-from wall_x.serving.keyframe_memory.state import Box, Selection
+from wall_x.model.core.keyframe_memory.boxes import BOX_SCALE, Box
+from wall_x.serving.keyframe_memory.state import Selection
 
-BOX_SCALE = 1000
 _MAX_DIGITS = 4
 # Training-format box text and its expected tokenization; checked against the
 # checkpoint tokenizer so the grammar matches the trained answer format.

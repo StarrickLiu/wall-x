@@ -42,6 +42,30 @@ def _adarms_horizon(config, cond):
     return config.action_horizon_flow
 
 
+def _replace_interval_scored(
+    per_token, logits, loss_mask, interval_rows, interval_accepted
+):
+    """Score the marked answer positions against their accepted set.
+
+    Some answers have more than one right token -- a keyframe written one
+    candidate early records the same progress -- and the batch says which
+    positions those are. Everything else keeps its ordinary cross-entropy.
+    """
+    if interval_rows is None or interval_accepted is None or loss_mask is None:
+        return per_token
+    from wall_x.model.core.selection_loss import interval_cross_entropy
+
+    rows = interval_rows[..., 1:].to(loss_mask.device)[loss_mask]
+    marked = rows >= 0
+    if not bool(marked.any()):
+        return per_token
+    scored = interval_cross_entropy(
+        logits[marked], interval_accepted.to(logits.device)[rows[marked]])
+    out = per_token.clone()
+    out[marked] = scored.to(out.dtype)
+    return out
+
+
 class ActionModelMixMin:
     # config: Qwen2_5_VLConfig
     action_preprocessor: ActionProcessor
@@ -692,6 +716,8 @@ class ActionGenerationMixin(GenerationMixin):
         labels=None,
         action_chunk=None,
         dof_mask=None,
+        interval_rows=None,
+        interval_accepted=None,
         flow=None,
         flow_loss_mask=None,
         _lm_loss_mask=None,
@@ -761,6 +787,9 @@ class ActionGenerationMixin(GenerationMixin):
                     shift_labels_flat = shift_labels_flat.to(shift_logits.device)
 
                     _cross_entropy_loss = self.loss_fct(shift_logits, shift_labels_flat)
+                    _cross_entropy_loss = _replace_interval_scored(
+                        _cross_entropy_loss, shift_logits, _lm_loss_mask,
+                        interval_rows, interval_accepted)
 
                     batch_idx = (
                         torch.arange(batch_size, device=_lm_loss_mask.device)

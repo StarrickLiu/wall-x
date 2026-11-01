@@ -205,6 +205,7 @@ class VLAdapter(ModelAdapter):
                 model, self.cfg.model.pretrained_path
             )
             self.validate_pretrained_load_result(model, err)
+            self._start_refiner_from_the_loaded_policy(model, err)
 
         if processor is not None:
             current_vocab_size = model.get_input_embeddings().weight.shape[0]
@@ -233,6 +234,32 @@ class VLAdapter(ModelAdapter):
             )
 
         return model
+
+    def _start_refiner_from_the_loaded_policy(self, model, load_result) -> None:
+        """Refill the twins from the policy that was just loaded into the base.
+
+        The twins exist from construction, so a stage-2 run that starts from a
+        stage-1 checkpoint finds them holding the model's construction-time
+        values -- the checkpoint has no twin tensors to fill them with. Copying
+        the loaded policy into them starts the refiner as a correction of
+        *that* policy. A checkpoint that does carry twins is resuming a refiner
+        and is left alone.
+        """
+        if not self.trains_refiner:
+            return
+        from wall_x.model.core.refiner import is_twin_key, seed_twins
+
+        missing = list(getattr(load_result, "missing_keys", ()) or ())
+        if not any(is_twin_key(key) for key in missing):
+            if self.logger:
+                self.logger.info(
+                    "Refiner: the checkpoint carries twin weights; resuming them")
+            return
+        filled = seed_twins(model.model if hasattr(model, "model") else model)
+        if self.logger:
+            self.logger.info(
+                "Refiner: seeded %d twin modules from the loaded policy, output "
+                "head zeroed", filled)
 
     def validate_pretrained_load_result(self, model, load_result):
         """Variant hook for enforcing checkpoint coverage after a non-strict load."""
@@ -341,11 +368,64 @@ class VLAdapter(ModelAdapter):
         bundle = build_data(self.cfg, ctx)
         return bundle.dataset, bundle.train_loader, bundle.train_iters
 
+    # ---- refiner ----
+    @property
+    def refiner_settings(self) -> dict:
+        """``model.refiner`` as a dict, empty when this run has no refiner."""
+        return dict(getattr(self.cfg.model, "refiner", None) or {})
+
+    @property
+    def trains_refiner(self) -> bool:
+        return bool(self.refiner_settings.get("enabled"))
+
+    def _refiner_margins(self):
+        """The calibrated margins this run scores its candidates against.
+
+        Read once. Without a file the whole batch is scored, which is a
+        different experiment from the released recipe, so it is announced
+        rather than assumed.
+        """
+        if getattr(self, "_refiner_margins_cache", None) is not None:
+            return self._refiner_margins_cache
+        from wall_x.model.core.refiner.train import load_margins
+
+        path = (dict(getattr(self.cfg.data, "refiner", None) or {})).get("margins")
+        if not path:
+            if self.logger:
+                self.logger.warning(
+                    "No data.refiner.margins: every candidate will be scored, "
+                    "including the ones the base model had good reason to put "
+                    "elsewhere. Calibrate with "
+                    "scripts/calibrate_refiner_margins.py."
+                )
+            self._refiner_margins_cache = (None, None)
+        else:
+            self._refiner_margins_cache = load_margins(path)
+            if self.logger:
+                table, default = self._refiner_margins_cache
+                self.logger.info(
+                    "Refiner margins: %d tasks from %s%s",
+                    len(table), path, "" if default is None else " (+ a default)")
+        return self._refiner_margins_cache
+
+    def forward_arguments(self, mode: str) -> dict:
+        """The mode and extra arguments a call to the model needs.
+
+        One place, because every adapter variant has its own ``forward`` and a
+        routing decision made in only one of them is a routing decision that
+        silently does not apply to the others.
+        """
+        if self.trains_refiner and mode in ("train", "refiner"):
+            table, default = self._refiner_margins()
+            return {"mode": "refiner", "refiner_margins": table,
+                    "refiner_default_margins": default}
+        return {"mode": mode}
+
     # ---- forward / loss ----
     def forward(self, model, batch, **kwargs):
         self._last_batch_info = self._extract_batch_info(batch)
         mode = kwargs.get("mode", "train")
-        return model(**batch, mode=mode)
+        return model(**batch, **self.forward_arguments(mode))
 
     def extract_loss(self, outputs):
         return outputs.loss
@@ -370,6 +450,17 @@ class VLAdapter(ModelAdapter):
         packing_active = bool(
             (getattr(self, "_last_batch_info", None) or {}).get("packing_active")
         )
+
+        # A refiner step reports what it corrected and how much of the batch
+        # the margins let it score. Without the second number a run that drops
+        # most of its candidates looks like a run that is training normally.
+        refiner_loss = self.get_output_field(outputs, "refiner_loss")
+        if refiner_loss is not None:
+            step_stats["refiner_loss"] = reduce_tensor_fn(refiner_loss).item()
+            for key in ("kept", "dropped", "correction"):
+                value = self.get_output_field(outputs, key)
+                if value is not None:
+                    step_stats[f"refiner_{key}"] = float(value)
 
         cross_entropy_loss = self.get_output_field(outputs, "cross_entropy_loss")
         if cross_entropy_loss is not None and not packing_active:

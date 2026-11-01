@@ -97,7 +97,8 @@ data:
     action: action
   norm_stats_path: <path/to/data>/arrange_3_flowers_wrc_red_norm_stats.json
   train_test_split: 0.95
-  # CPFS + torch DataLoader workers may hit Errno 95; use 0 if that happens.
+  # A network filesystem plus torch DataLoader workers may hit Errno 95; use 0
+  # if that happens.
   num_workers: 0
   max_length: 1024
   resolution:

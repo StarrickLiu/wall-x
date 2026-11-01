@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 
 import torch
 import torch.nn as nn
@@ -389,6 +390,76 @@ def create_normalizers_from_lerobot_norm_stats(
         Normalizer.from_lerobot_norm_stats(action_stats, dataset_name),
         Normalizer.from_lerobot_norm_stats(propri_stats, dataset_name),
     )
+
+
+NORMALIZER_FILES = ("normalizer_action.pth", "normalizer_propri.pth")
+
+
+def load_checkpoint_normalizers(source):
+    """The normalizers a checkpoint ships, or ``None`` if it ships none.
+
+    Statistics belong to the data a checkpoint was trained on, and the weights
+    were fitted reading them: measuring new ones on other data would hand the
+    same weights a different scale. So a run that continues from a checkpoint
+    inherits its statistics rather than computing its own.
+
+    ``source`` is a local directory or a Hugging Face repository id.
+    """
+    local_dir = os.path.isdir(str(source))
+    paths = []
+    for name in NORMALIZER_FILES:
+        local = os.path.join(str(source), name)
+        if os.path.isfile(local):
+            paths.append(local)
+            continue
+        # A local directory is answered locally: asking the hub about a path
+        # would be a network call with a filename for a repository id.
+        fetched = None if local_dir else _normalizer_from_hub(source, name)
+        if fetched is None:
+            return None
+        paths.append(fetched)
+    return Normalizer.from_ckpt(paths[0]), Normalizer.from_ckpt(paths[1])
+
+
+def _normalizer_from_hub(repo_id, filename):
+    """The file out of a Hugging Face repository, or ``None``.
+
+    A missing file is the normal answer for a checkpoint that ships no
+    statistics -- a plain VLM, for instance -- so it is not an error here.
+    """
+    try:
+        from huggingface_hub import hf_hub_download
+
+        return hf_hub_download(repo_id=str(repo_id), filename=filename)
+    except Exception as error:  # offline, private, no such file, not a repo id
+        logger.debug("no %s in %s: %s", filename, repo_id, error)
+        return None
+
+
+def normalizers_from_config(cfg):
+    """The normalizers a run uses: from its own statistics, or its checkpoint.
+
+    Returns ``(action, propri, statistics)``, where ``statistics`` is the
+    per-dof dictionary behind them and ``None`` when the normalizers came
+    ready-made with a checkpoint.
+    """
+    norm_cfg = dict(getattr(cfg.data, "normalizer_config", None) or {})
+    stats_path = norm_cfg.get("customized_action_statistic_dof")
+    if not stats_path:
+        source = norm_cfg.get("from_checkpoint") or cfg.model.pretrained_path
+        loaded = load_checkpoint_normalizers(source) if source else None
+        if loaded is not None:
+            logger.info("Normalizers: the ones %s ships", source)
+            return loaded[0], loaded[1], None
+    return create_normalizers({
+        "dof_config": cfg.task.dof_config,
+        "agent_pos_config": cfg.task.agent_pos_config,
+        "normalizer_config": {
+            "customized_action_statistic_dof": stats_path,
+            "min_key": norm_cfg.get("min_key", "min"),
+            "delta_key": norm_cfg.get("delta_key", "delta"),
+        },
+    })
 
 
 def create_normalizers(config, action_statistic_dof=None):

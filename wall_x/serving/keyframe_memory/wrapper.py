@@ -23,14 +23,14 @@ import torch
 from transformers import LogitsProcessorList
 
 from wall_x._vendor.harrix.infer.model_wrapper import WallxModelWrapper, move_to_cuda
-from wall_x.serving.keyframe_memory.boxes import crop_to_box
+from wall_x.model.core.keyframe_memory.boxes import crop_to_box
 from wall_x.serving.keyframe_memory.config import KeyframeMemoryConfig
 from wall_x.serving.keyframe_memory.grammar import (
     SelectionGrammar,
     SelectionTokens,
     parse_selection,
 )
-from wall_x.serving.keyframe_memory.prompts import inject_memory, selection_prompt
+from wall_x.model.core.keyframe_memory.prompts import inject_memory, selection_prompt
 from wall_x.serving.keyframe_memory.state import (
     Box,
     Frame,

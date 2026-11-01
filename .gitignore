@@ -43,3 +43,6 @@ workspace/rtx5090/local/env.sh
 
 # Compiled CUDA operators
 *.so
+
+# Written by the normalizer when a config key has no statistics.
+normalizer_missing_information_*.txt

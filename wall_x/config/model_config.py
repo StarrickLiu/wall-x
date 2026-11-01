@@ -41,6 +41,12 @@ class QActModelConfig(ModelConfig):
     rvq_checkpoint_contract: str = "strict"
     new_special_tokens: Optional[List[str]] = None
     flow_loss_weight: float = 1.0
+    # The residual refiner, as ``vla_config.refiner`` reads it: ``enabled``,
+    # ``num_steps``, ``timestep``, ``refine_loops``, ``refine_step_scale``,
+    # ``loss_on_final_only``, ``freeze_base``. Declared here because the model
+    # topology changes with it -- enabling it builds a second copy of the
+    # action branch -- so it belongs with the model, not the data.
+    refiner: Optional[Dict[str, Any]] = None
     enable_customized_robot_config: bool = False
     customized_robot_config: Optional[Dict[str, Any]] = None
 

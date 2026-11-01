@@ -29,7 +29,7 @@ from wall_x.trainer.fsdp_trainer.distribution_strategy import build_strategy
 from wall_x.trainer.metrics import MetricsLogger
 from wall_x.trainer.utils import move_batch_to_device
 
-from wall_x.model.core.action.normalizer import create_normalizers
+from wall_x.model.core.action.normalizer import normalizers_from_config
 from wall_x.trainer.scheduler.scheduler import get_scheduler
 
 
@@ -285,17 +285,11 @@ class FSDPTrainer(DistributedTrainer):
                 )
                 return
 
-        merged = {
-            "dof_config": self.cfg.task.dof_config,
-            "agent_pos_config": self.cfg.task.agent_pos_config,
-            "normalizer_config": {
-                "customized_action_statistic_dof": custom_stats_path,
-                "min_key": norm_cfg.get("min_key", "min"),
-                "delta_key": norm_cfg.get("delta_key", "delta"),
-            },
-        }
+        # Otherwise the statistics come from a file the config names, or --
+        # when it names none -- from the checkpoint this run starts from, which
+        # is the one that was trained reading them.
         self.normalizer_action, self.normalizer_propri, self._action_statistic_dof = (
-            create_normalizers(merged)
+            normalizers_from_config(self.cfg)
         )
 
     def backward(self, loss: torch.Tensor):
@@ -368,6 +362,9 @@ class FSDPTrainer(DistributedTrainer):
         """
         from wall_x.trainer.optimizer.utils import resolve_lr_group_configs
 
+        if self._freeze_for_refiner(model):
+            return
+
         opt = self.cfg.hyperparams.optimizer
         if not opt.train_action_expert_only:
             return
@@ -406,6 +403,37 @@ class FSDPTrainer(DistributedTrainer):
             f"*** train_action_expert_only: frozen {frozen_count} base params, "
             f"keeping {grouped_count} grouped params trainable ***"
         )
+
+    def _freeze_for_refiner(self, model: torch.nn.Module) -> bool:
+        """Freeze everything but the refiner's own weights, when asked.
+
+        The refiner corrects a policy; a gradient reaching that policy would
+        mean it is being changed instead. Returns whether it did anything, so
+        the caller leaves the other freezing rules alone.
+        """
+        from wall_x.model.core.refiner import TWIN_SUFFIX
+
+        settings = dict(getattr(self.cfg.model, "refiner", None) or {})
+        if not (settings.get("enabled") and settings.get("freeze_base", True)):
+            return False
+
+        trainable, frozen = 0, 0
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if TWIN_SUFFIX in name:
+                trainable += 1
+            else:
+                param.requires_grad = False
+                frozen += 1
+        if trainable == 0:
+            raise ValueError(
+                f"model.refiner.freeze_base froze every parameter: no {TWIN_SUFFIX!r} "
+                "weights exist. The twins are built when model.refiner.enabled is "
+                "set, so this means the refiner section never reached the model.")
+        self.log(f"*** refiner: training {trainable} twin params, "
+                 f"froze {frozen} base params ***")
+        return True
 
     def _wrap_model(self, model: torch.nn.Module):
         """Prepare model dtype/placement via adapter, then wrap via strategy.

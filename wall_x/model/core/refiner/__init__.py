@@ -5,6 +5,7 @@ from wall_x.model.core.refiner.twins import (
     TWIN_SUFFIX,
     install_twins,
     is_twin_key,
+    seed_twins,
     swapped_in,
 )
 
@@ -14,6 +15,7 @@ __all__ = [
     "install_twins",
     "is_twin_key",
     "refine",
+    "seed_twins",
     "swapped_in",
     "verify_loaded",
 ]

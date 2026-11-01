@@ -6,6 +6,7 @@ import torch
 from typing import Optional
 from torchdiffeq import odeint
 
+from wall_x.model.core.action.flow_sample import CachedFlowSample
 from wall_x.model.core.refiner import RefinerConfig, refine
 
 logger = logging.getLogger(__name__)
@@ -191,8 +192,7 @@ class Qwen3_5VLAInferenceMixin:
         valid_queries = valid_tokens[:, prefix_length:]
         return valid_queries.unsqueeze(2) & valid_tokens.unsqueeze(1)
 
-    @torch.no_grad()
-    def generate_flow_action_with_cache(
+    def sample_flow_with_cache(
         self,
         input_ids,
         action_horizon,
@@ -216,10 +216,22 @@ class Qwen3_5VLAInferenceMixin:
         proprioception: Optional[torch.FloatTensor] = None,
         agent_pos_mask: Optional[torch.Tensor] = None,
         dataset_names: Optional[str] = None,
-        action_chunk: Optional[torch.FloatTensor] = None,
         **kwargs,
     ):
-        """Generate flow actions while reusing the immutable VLM prefix KV."""
+        """Integrate the flow and keep the way the observation was read.
+
+        Returns the candidate chunk together with ``run_lm`` -- the closure
+        that drives the decoder over the action postfix against the cached
+        prefix. A second pass over the candidate (the residual refiner, at
+        inference or while training it) has to see the same observation the
+        candidate was sampled from, and this is what makes that reusable
+        instead of rebuilt.
+
+        Not decorated with ``no_grad``: the caller decides. Serving wraps
+        the whole thing; training integrates the candidate without
+        gradients and then refines it with them, which is sound because the
+        cached prefix is a constant as far as the refiner weights go.
+        """
         if self._requests_rtc(kwargs):
             raise ValueError(
                 "RTC (prefix_actions with inference_delay > 0) is not implemented "
@@ -434,12 +446,71 @@ class Qwen3_5VLAInferenceMixin:
                 method="euler",
             )
             predict_action_norm = action_trajectory[-1]
-        predict_action_norm = self._refine(
-            predict_action_norm,
-            dof_mask=dof_mask,
-            embed_dtype=postfix_inputs_embeds.dtype,
-            num_inference_timesteps=num_inference_timesteps,
+        return CachedFlowSample(
+            candidate=predict_action_norm,
             run_lm=run_postfix,
+            embed_dtype=postfix_inputs_embeds.dtype,
+            dof_mask=dof_mask,
+            num_steps=num_inference_timesteps,
+        )
+
+    @torch.no_grad()
+    def generate_flow_action_with_cache(
+        self,
+        input_ids,
+        action_horizon,
+        action_dim,
+        init_noise: Optional[torch.Tensor] = None,
+        # vlm
+        inputs_embeds: torch.FloatTensor | None = None,
+        pixel_values: torch.Tensor | None = None,
+        pixel_values_videos: torch.FloatTensor | None = None,
+        image_grid_thw: torch.LongTensor | None = None,
+        video_grid_thw: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        # for history observation
+        pixel_values_history: torch.Tensor | None = None,
+        image_grid_thw_history: torch.LongTensor | None = None,
+        history_image_mask: torch.Tensor | None = None,
+        # for vla
+        num_inference_timesteps: int = 10,
+        dof_mask: Optional[torch.Tensor] = None,
+        proprioception: Optional[torch.FloatTensor] = None,
+        agent_pos_mask: Optional[torch.Tensor] = None,
+        dataset_names: Optional[str] = None,
+        action_chunk: Optional[torch.FloatTensor] = None,
+        **kwargs,
+    ):
+        """Generate flow actions while reusing the immutable VLM prefix KV."""
+        sample = self.sample_flow_with_cache(
+            input_ids=input_ids,
+            action_horizon=action_horizon,
+            action_dim=action_dim,
+            init_noise=init_noise,
+            inputs_embeds=inputs_embeds,
+            pixel_values=pixel_values,
+            pixel_values_videos=pixel_values_videos,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            pixel_values_history=pixel_values_history,
+            image_grid_thw_history=image_grid_thw_history,
+            history_image_mask=history_image_mask,
+            num_inference_timesteps=num_inference_timesteps,
+            dof_mask=dof_mask,
+            proprioception=proprioception,
+            agent_pos_mask=agent_pos_mask,
+            dataset_names=dataset_names,
+            **kwargs,
+        )
+        predict_action_norm = self._refine(
+            sample.candidate,
+            dof_mask=sample.dof_mask,
+            embed_dtype=sample.embed_dtype,
+            num_inference_timesteps=sample.num_steps,
+            run_lm=sample.run_lm,
         )
 
         predict_action = self.action_preprocessor.normalizer_action.unnormalize_data(

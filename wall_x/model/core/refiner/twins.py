@@ -91,6 +91,34 @@ def install_twins(model: nn.Module) -> List[str]:
     return created
 
 
+def seed_twins(model: nn.Module) -> int:
+    """Refill every twin from the weights beside it; zero the output head.
+
+    The twins are built with the model, which happens before a checkpoint is
+    loaded, so a run starting from a policy checkpoint finds them holding the
+    random values the model was constructed with. Refilling them makes the
+    refiner start as a copy of the policy it corrects, with a zeroed output
+    head so that it starts by changing nothing.
+
+    Only for starting a refiner off; resuming one would overwrite what it has
+    learned, so the caller checks whether the checkpoint carried twins.
+    """
+    filled = 0
+    for module in model.modules():
+        for attr, child in list(module._modules.items()):
+            if child is None or not attr.endswith(TWIN_SUFFIX):
+                continue
+            base = module._modules.get(attr[: -len(TWIN_SUFFIX)])
+            if base is None:
+                continue
+            child.load_state_dict(base.state_dict())
+            filled += 1
+    processor = processor_twin(model, required=False)
+    if processor is not None:
+        _zero_(processor.action_proj_back)
+    return filled
+
+
 def has_twins(model: nn.Module) -> bool:
     return processor_twin(model, required=False) is not None
 

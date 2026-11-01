@@ -37,15 +37,18 @@ class Qwen3_5Adapter(VLAdapter):
     def forward(self, model, batch, **kwargs):
         self._last_batch_info = self._extract_batch_info(batch)
         mode = kwargs.get("mode", "train")
+        arguments = self.forward_arguments(mode)
         weight = getattr(self.cfg.model, "ar_action_loss_weight", None)
-        if weight is None:
-            return model(**batch, mode=mode)
+        # A refiner step has no autoregressive loss to weight: it scores a
+        # correction against a demonstration and nothing else.
+        if weight is None or arguments["mode"] == "refiner":
+            return model(**batch, **arguments)
         resolved_weight = self._resolve_ar_action_loss_weight(
             weight,
             kwargs.get("global_step", 0),
             training=model.training and mode == "train",
         )
-        return model(**batch, mode=mode, ar_action_loss_weight=resolved_weight)
+        return model(**batch, ar_action_loss_weight=resolved_weight, **arguments)
 
     @property
     def default_action_lr_keywords(self) -> list[str]:

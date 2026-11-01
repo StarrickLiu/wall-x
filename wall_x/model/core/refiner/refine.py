@@ -93,6 +93,19 @@ def refine(
     Each pass conditions on the current estimate and returns its residual; the
     estimate moves by ``refine_step_scale`` of it. With one pass at scale 1.0
     (every pre-loop checkpoint) this is ``candidate + residual``, unchanged.
+
+    Only the last pass carries a gradient. The earlier ones build the estimate
+    the last one starts from, and are run as the frozen work they are at
+    inference. Two reasons, and the first is the honest one:
+
+    - the weights are shared across passes, so backpropagating the chain uses
+      each decoder layer several times in one graph, and the optimizer that
+      owns these parameters reshards a layer after its first backward edge --
+      the second use then finds an empty parameter;
+    - what the refiner has to learn is the last correction, conditioned on an
+      estimate it produced itself. That is exactly what it does at inference.
+
+    Serving is unaffected: it runs the whole thing without gradients anyway.
     """
     batch, horizon, dim = candidate.shape
     processor = processor_twin(model)
@@ -100,22 +113,28 @@ def refine(
         (batch,), config.timestep, device=candidate.device, dtype=torch.float32
     )
     action_hidden = model.config.vla_config.dim_inputs[1]
-    head = processor.action_proj_back
     refined = candidate
-    for _ in range(config.refine_loops):
-        with swapped_in(model):
-            embeds, adarms = processor.step(
-                timestep=timestep, noisy_action=refined, dof_mask=dof_mask
+    last = config.refine_loops - 1
+    for index in range(config.refine_loops):
+        # Earlier passes are the estimate, not the thing being trained.
+        grad_enabled = torch.is_grad_enabled() and index == last
+        with torch.set_grad_enabled(grad_enabled), swapped_in(model):
+            # Both passes go through the processor's own forward rather than
+            # reaching into it: these are the refiner's weights, and a
+            # distributed wrapper only materializes them while the module it
+            # hung its hook on is running.
+            embeds, adarms = processor(
+                refined, None, timestep, dof_mask=dof_mask, mode="embed"
             )
             output = run_lm(embeds[:, :, :action_hidden].to(embed_dtype), adarms)
-        residual = head(output.action_embeds.to(head.weight.dtype)).float()
-        residual = residual.reshape(batch, horizon, dim)
-        # Scale 1.0 takes the residual as-is, so one-pass checkpoints stay
-        # bit-identical to the single-pass release.
-        if config.refine_step_scale == 1.0:
-            refined = refined + residual
-        else:
-            refined = refined + config.refine_step_scale * residual
+            residual = processor(output.action_embeds, None, None, mode="project")
+            residual = residual.float().reshape(batch, horizon, dim)
+            # Scale 1.0 takes the residual as-is, so one-pass checkpoints stay
+            # bit-identical to the single-pass release.
+            if config.refine_step_scale == 1.0:
+                refined = refined + residual
+            else:
+                refined = refined + config.refine_step_scale * residual
     return refined
 
 

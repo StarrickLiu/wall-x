@@ -11,6 +11,7 @@ from wall_x.model.core.refiner import (
     install_twins,
     is_twin_key,
     refine,
+    seed_twins,
     swapped_in,
     verify_loaded,
 )
@@ -25,6 +26,16 @@ class Processor(nn.Module):
 
     def step(self, timestep, noisy_action, dof_mask=None):
         return self.w(noisy_action), timestep
+
+    def forward(self, action_chunk, dataset_names, sample_time, dof_mask=None,
+                mode=None):
+        # The refiner reaches these weights through forward, so that a sharded
+        # parameter is materialized by the wrapper that owns it.
+        if mode == "embed":
+            return self.step(sample_time, action_chunk, dof_mask)
+        if mode == "project":
+            return self.action_proj_back(action_chunk)
+        raise AssertionError(f"the refiner only embeds and projects, got {mode!r}")
 
 
 class Layer(nn.Module):
@@ -214,22 +225,34 @@ def test_refine_config_rejects_bad_loop_settings(bad):
 # ----------------------------------------------------------------------
 # Flow dispatch: RTC requests take the uncached path, the cached path refuses them
 # ----------------------------------------------------------------------
-from wall_x.model.qact.qwen3_5.qwen3_5_inference_mixin import Qwen3_5VLAInferenceMixin
+def dispatch():
+    """A stand-in model carrying only the flow dispatch, built on demand.
 
+    The import is deferred so the twin, config and refinement checks above run
+    anywhere; importing the model package needs the transformers version the
+    training image pins.
+    """
+    mixin = pytest.importorskip(
+        "wall_x.model.qact.qwen3_5.qwen3_5_inference_mixin",
+        reason="importing the model package needs the pinned transformers version")
+    Qwen3_5VLAInferenceMixin = mixin.Qwen3_5VLAInferenceMixin
 
-class _Dispatch(Qwen3_5VLAInferenceMixin):
-    def __init__(self):
-        self.config = SimpleNamespace(
-            _attn_implementation="sdpa",
-            vla_config=SimpleNamespace(action_linear_attention=False, causal_action_attention_mask=False),
-        )
+    class _Dispatch(Qwen3_5VLAInferenceMixin):
+        def __init__(self):
+            self.config = SimpleNamespace(
+                _attn_implementation="sdpa",
+                vla_config=SimpleNamespace(action_linear_attention=False,
+                                           causal_action_attention_mask=False),
+            )
 
-    def generate_flow_action_no_cache(self, **kwargs):
-        return "no_cache"
+        def generate_flow_action_no_cache(self, **kwargs):
+            return "no_cache"
+
+    return _Dispatch()
 
 
 def test_rtc_requests_use_the_uncached_path():
-    model = _Dispatch()
+    model = dispatch()
     model.generate_flow_action_with_cache = lambda **kwargs: "with_cache"
     prefix = torch.zeros(1, 4, 2)
     assert model.generate_flow_action() == "with_cache"
@@ -238,8 +261,51 @@ def test_rtc_requests_use_the_uncached_path():
 
 
 def test_cached_path_refuses_rtc():
+    model = dispatch()
     with pytest.raises(ValueError, match="RTC"):
-        Qwen3_5VLAInferenceMixin.generate_flow_action_with_cache(
-            _Dispatch(), input_ids=None, action_horizon=4, action_dim=2,
+        type(model).generate_flow_action_with_cache(
+            model, input_ids=None, action_horizon=4, action_dim=2,
             prefix_actions=torch.zeros(1, 4, 2), inference_delay=2,
         )
+
+
+# ----------------------------------------------------------------------
+# Starting a refiner off: the twins are built before any checkpoint is loaded
+# ----------------------------------------------------------------------
+def test_the_twins_are_refilled_from_the_weights_beside_them():
+    # Built with the model, the twins hold the construction-time values; a run
+    # that starts from a policy checkpoint has to refill them or it trains a
+    # correction on top of random features.
+    model = Inner()
+    install_twins(model)
+    with torch.no_grad():                      # the policy arrives afterwards
+        for layer in model.language_model:
+            layer.q_proj_action.weight.fill_(0.25)
+        model.action_processor.w.weight.fill_(0.5)
+
+    assert not torch.equal(model.language_model[0].q_proj_action_refiner.weight,
+                           model.language_model[0].q_proj_action.weight)
+    filled = seed_twins(model)
+    assert filled >= 5
+    assert torch.equal(model.language_model[0].q_proj_action_refiner.weight,
+                       model.language_model[0].q_proj_action.weight)
+    assert torch.equal(model.action_processor_refiner.w.weight,
+                       model.action_processor.w.weight)
+
+
+def test_refilling_leaves_the_output_head_at_zero():
+    # A refiner that starts by changing nothing is a refiner that starts from
+    # the policy's own behaviour.
+    model = Inner()
+    install_twins(model)
+    with torch.no_grad():
+        model.action_processor.action_proj_back.weight.fill_(0.3)
+        model.action_processor.action_proj_back.bias.fill_(0.7)
+    seed_twins(model)
+    head = model.action_processor_refiner.action_proj_back
+    assert float(head.weight.abs().sum()) == 0.0
+    assert float(head.bias.abs().sum()) == 0.0
+
+
+def test_refilling_a_model_without_twins_does_nothing():
+    assert seed_twins(Inner()) == 0

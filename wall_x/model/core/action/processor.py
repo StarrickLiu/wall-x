@@ -150,16 +150,38 @@ class ActionProcessor(nn.Module):
                 proprio_embed = torch.cat([proprio_embed, padding], dim=-1)
         return proprio_embed  # [batch_size, 1, hidden_size]
 
-    def forward(self, action_chunk, dataset_names, sample_time, dof_mask=None):
+    def forward(
+        self, action_chunk, dataset_names, sample_time, dof_mask=None, mode=None
+    ):
         """
         Args:
             action_chunk (torch.Tensor): action sequence with shape [batch_size, action_chunk_len, action_dim]
             dataset_names: [batch_size]
             dof_mask: [batch_size, action_dim]
+            mode: ``None`` noises the chunk and embeds it, which is what
+                training does. ``"embed"`` embeds it as given, at
+                ``sample_time`` -- what :meth:`step` computes. ``"project"``
+                maps decoder outputs back to action space.
+
+                The last two exist so that a caller reaching these weights from
+                outside -- the residual refiner -- goes through this forward.
+                A distributed wrapper materializes a sharded parameter only
+                while the module that owns it is running, and it hangs its hook
+                on that module; calling a method, or a leaf submodule, hands
+                back an empty parameter instead.
 
         Returns:
             torch.Tensor: processed action representation with shape [batch_size, seq_len, hidden_size]
         """
+        if mode == "embed":
+            return self.step(
+                timestep=sample_time, noisy_action=action_chunk, dof_mask=dof_mask
+            )
+        if mode == "project":
+            return self.action_proj_back(
+                action_chunk.to(self.action_proj_back.weight.dtype))
+        if mode is not None:
+            raise ValueError(f"unknown action processor mode {mode!r}")
         with torch.autocast("cuda", dtype=torch.float32):
             action_chunk = action_chunk.to(dtype=torch.float32)
 

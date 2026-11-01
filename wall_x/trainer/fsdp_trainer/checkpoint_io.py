@@ -1205,8 +1205,8 @@ def _load_fsdp2_or_dmuon_full(
     if only rank 0 has the data, new owners on other ranks (after a
     cross-ws resume) silently miss their assigned params and
     ``_owned_data`` stays at fresh-init (random weights), producing a
-    massive post-resume loss spike. The ckpt files live on CPFS and are
-    shared, so per-rank reads are essentially free.
+    massive post-resume loss spike. The checkpoint is on shared storage, so
+    per-rank reads are essentially free.
     """
     is_main = dist.get_rank() == 0 if dist.is_initialized() else True
     safetensors_path = os.path.join(checkpoint_path, "model.safetensors")
