@@ -22,6 +22,35 @@ from wall_x._vendor.x2robot_utils.text_templates import (
     _PUBLIC_CAMERA_LABELS as _CAM_NAME_MAPPING,
 )
 
+from wall_x._vendor.x2robot_utils.grounding import (
+    reverse_grounding_points,
+    extract_grounding_points,
+)
+
+from wall_x._vendor.harrix.infer.infer_config import (
+    InferConfig,
+    resolve_embodiment_type,
+    resolve_prompt_dataset_family,
+)
+from wall_x._vendor.harrix.utils.dataset_v2 import (
+    InferenceDataConfig,
+    build_dataset_v2_text_processor,
+    dataset_v2_smart_resize,
+    inject_dataset_v2_state_strings,
+    replace_state_schema_placeholder,
+    validate_inference_data_semantics,
+)
+from wall_x.model.core.refiner import RefinerConfig, verify_loaded
+from wall_x.model.core.action.normalizer import (
+    NORM_KEY_SEP,
+    Normalizer,
+    make_norm_key,
+)
+from wall_x._vendor.harrix.infer.logger import InferLogger
+from wall_x._vendor.harrix.utils.normalizer import pad_norm_stats_like_collator
+from wall_x.utils.timers import timer, ScopeTimer
+from wall_x.data.backends.lerobot.utils import NormStats
+
 
 def camera_prompt_label(cam_name, camera_name_mapping, public_labels):
     """Label a camera in the prompt.
@@ -67,34 +96,6 @@ def apply_fixed_zero_state(agent_pos, agent_pos_mask, layout, keys):
             f"{missing}; layout={list(layout)}"
         )
     return agent_pos, agent_pos_mask
-from wall_x._vendor.x2robot_utils.grounding import (
-    reverse_grounding_points,
-    extract_grounding_points,
-)
-
-from wall_x._vendor.harrix.infer.infer_config import (
-    InferConfig,
-    resolve_embodiment_type,
-    resolve_prompt_dataset_family,
-)
-from wall_x._vendor.harrix.utils.dataset_v2 import (
-    InferenceDataConfig,
-    build_dataset_v2_text_processor,
-    dataset_v2_smart_resize,
-    inject_dataset_v2_state_strings,
-    replace_state_schema_placeholder,
-    validate_inference_data_semantics,
-)
-from wall_x.model.core.refiner import RefinerConfig, verify_loaded
-from wall_x.model.core.action.normalizer import (
-    NORM_KEY_SEP,
-    Normalizer,
-    make_norm_key,
-)
-from wall_x._vendor.harrix.infer.logger import InferLogger
-from wall_x._vendor.harrix.utils.normalizer import pad_norm_stats_like_collator
-from wall_x.utils.timers import timer, ScopeTimer
-from wall_x.data.backends.lerobot.utils import NormStats
 
 
 ENABLE_FAST_PREPROCESS = os.getenv("ENABLE_FAST_PREPROCESS", "False").lower() == "true"
